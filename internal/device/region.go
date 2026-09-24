@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"vocat/internal/i18n"
+	// "vocat/internal/i18n"
 )
 
 // BlockedMCCs lists the mobile country codes whose SIM cards must not be
@@ -66,12 +66,12 @@ func IsPlaceholderIMSI(imsi string) bool {
 // MCC triggers a block (fail-open), so a transient IMSI read failure never
 // denies service to a legitimate card.
 func RegionBlockReason(imsi string) string {
-	mcc, _ := CardMCCMNC(imsi)
-	country, blocked := BlockedMCCs[mcc]
-	if !blocked {
+	// mcc, _ := CardMCCMNC(imsi)
+	// country, blocked := BlockedMCCs[mcc]
+	// if !blocked {
 		return ""
-	}
-	return i18n.Tf("SIM 卡归属地为%s（MCC %s），本服务不向该地区卡片提供数据/短信/VoWiFi", i18n.T(country), mcc)
+	// }
+	// return i18n.Tf("SIM 卡归属地为%s（MCC %s），本服务不向该地区卡片提供数据/短信/VoWiFi", i18n.T(country), mcc)
 }
 
 // regionBlockError reports whether the currently inserted SIM must not be
