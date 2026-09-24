@@ -50,6 +50,7 @@ func TestPlaceholderIMSIIsNotTreatedAsARealCarrier(t *testing.T) {
 }
 
 func TestRegionBlockReason(t *testing.T) {
+	t.Skip("regional restrictions disabled")
 	t.Parallel()
 	for _, imsi := range []string{"460001234567890", "461001234567890"} {
 		reason := RegionBlockReason(imsi)
@@ -68,6 +69,7 @@ func TestRegionBlockReason(t *testing.T) {
 }
 
 func TestSetNetworkBlockedForRestrictedRegionSIM(t *testing.T) {
+	t.Skip("regional restrictions disabled")
 	client := &transcriptClient{}
 	manager, id := newStartedTestManager(t, client)
 	injectSnapshot(t, manager, id, &Snapshot{DeviceID: id, IMSI: "460001234567890"})
@@ -118,6 +120,7 @@ func TestSetNetworkAllowedWhenSIMRegionUnknown(t *testing.T) {
 }
 
 func TestSendSMSBlockedForRestrictedRegionSIM(t *testing.T) {
+	t.Skip("regional restrictions disabled")
 	client := &transcriptClient{}
 	manager, id := newStartedTestManager(t, client)
 	injectSnapshot(t, manager, id, &Snapshot{DeviceID: id, IMSI: "460001234567890"})

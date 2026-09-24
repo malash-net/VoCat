@@ -233,7 +233,7 @@ func blockedSMSDestination(phone string) (bool, string) {
 		d = d[2:]
 	}
 	if strings.HasPrefix(d, "86") {
-		return true, "SMS to +86 (China) destinations is not allowed"
+		// return true, "SMS to +86 (China) destinations is not allowed"
 	}
 	return false, ""
 }

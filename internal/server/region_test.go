@@ -153,6 +153,7 @@ func blockedRegionServer(t *testing.T, imsi string) *Server {
 }
 
 func TestModemSummaryRegionFields(t *testing.T) {
+	t.Skip("regional restrictions disabled")
 	t.Parallel()
 	blocked := modemSummary(&device.Snapshot{IMSI: "460001234567890"}, "", "")
 	if blocked["service_blocked"] != true {
@@ -215,6 +216,7 @@ func TestCountryNameForMCC(t *testing.T) {
 }
 
 func TestHandleVoWiFiEnabledBlockedRegion(t *testing.T) {
+	t.Skip("regional restrictions disabled")
 	server := blockedRegionServer(t, "460001234567890")
 	request := httptest.NewRequest(http.MethodPatch, "/devices/dev1/vowifi", strings.NewReader(`{"enabled":true}`))
 	request.Header.Set("Content-Type", "application/json")

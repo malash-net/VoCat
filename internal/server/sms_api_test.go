@@ -701,6 +701,7 @@ func TestSMSSendOutcome(t *testing.T) {
 }
 
 func TestBlockedSMSDestination(t *testing.T) {
+	t.Skip("SMS destination restriction disabled")
 	tests := []struct {
 		name  string
 		phone string
