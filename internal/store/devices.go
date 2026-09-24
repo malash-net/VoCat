@@ -18,6 +18,7 @@ const (
 	DeviceTypeDJI4G        = "dji_4g"
 	DeviceTypePCIeEC20EC25 = "pcie_ec20_ec25"
 	DeviceTypeUSBSIMReader = "usb_sim_reader"
+	DeviceTypeML307        = "ml307"
 )
 
 // NormalizeDeviceType returns a stable persisted device type identifier.
@@ -30,6 +31,8 @@ func NormalizeDeviceType(value string) string {
 		return DeviceTypeDJI4G
 	case DeviceTypeUSBSIMReader:
 		return DeviceTypeUSBSIMReader
+	case DeviceTypeML307:
+		return DeviceTypeML307
 	case "", DeviceTypePCIeEC20EC25:
 		return DeviceTypePCIeEC20EC25
 	default:
@@ -157,6 +160,10 @@ func upsertDevice(ctx context.Context, executor contextExecer, value Device) err
 		value.NetworkEnabled = false
 		value.SMSEnabled = true
 		value.VoWiFiEnabled = true
+	}
+	if value.DeviceType == DeviceTypeML307 {
+		value.DeviceBackend = "at"
+		value.VoWiFiEnabled = false
 	}
 	extra, err := normalizeJSONObject(value.Extra)
 	if err != nil {

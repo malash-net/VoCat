@@ -762,6 +762,24 @@ func restoreDefaultCellularRadios(
 		if config.DeviceType == store.DeviceTypeUSBSIMReader {
 			continue
 		}
+		if config.DeviceType == store.DeviceTypeML307 {
+			if config.VoWiFiEnabled || config.NetworkEnabled || config.DeviceBackend != "at" {
+				config.NetworkEnabled = false // Store normalizes the ML307 backend and VoWiFi flag.
+				if err := database.UpsertDevice(ctx, config); err != nil {
+					logger.Warn("save ML307 cellular SMS defaults", "device_id", config.ID, "error", err)
+					continue
+				}
+			}
+			if entry, err := mapper.Get(config.ID); err == nil {
+				restoreContext, cancel := startupFlightModeContext(ctx)
+				_, err = manager.SetFlight(restoreContext, entry.ID, false)
+				cancel()
+				if err != nil {
+					logger.Warn("ML307 cellular SMS radio startup failed", "device_id", config.ID, "error", err)
+				}
+			}
+			continue
+		}
 		if config.VoWiFiEnabled {
 			continue
 		}
@@ -951,6 +969,9 @@ func configureVoWiFiRuntime(
 			if err != nil {
 				return nil, fmt.Errorf("load device %q VoWiFi config: %w", deviceID, err)
 			}
+			if deviceConfig.DeviceType == store.DeviceTypeML307 {
+				return nil, errors.New("ML307 supports cellular SMS only")
+			}
 			adapter := vowifiDeviceAdapter(ec20Adapter)
 			if deviceConfig.DeviceType == store.DeviceTypeUSBSIMReader {
 				adapter = pcscAdapter
@@ -967,6 +988,9 @@ func configureVoWiFiRuntime(
 		return nil, err
 	}
 	for _, deviceConfig := range configured {
+		if deviceConfig.DeviceType == store.DeviceTypeML307 {
+			continue
+		}
 		if err := manager.Ensure(ctx, deviceConfig.ID); err != nil {
 			_ = manager.Close(context.Background())
 			return nil, fmt.Errorf("register device %q VoWiFi runtime: %w", deviceConfig.ID, err)
@@ -1345,7 +1369,7 @@ func provisionDiscoveredDevices(
 			ESIMTransport:  esimTransport,
 			NetworkEnabled: false,
 			SMSEnabled:     supportsSMS,
-			VoWiFiEnabled:  true,
+			VoWiFiEnabled:  deviceType != store.DeviceTypeML307,
 		}); err != nil {
 			return err
 		}
@@ -1354,6 +1378,9 @@ func provisionDiscoveredDevices(
 }
 
 func provisionedDeviceType(candidate modem.Candidate) string {
+	if modem.IsML307USB(candidate.VendorID, candidate.ProductID) {
+		return store.DeviceTypeML307
+	}
 	controlName := filepath.Base(filepath.Clean(candidate.QMIControl))
 	if candidate.HardwareKind == "wwan" &&
 		strings.HasPrefix(controlName, "wwan") && strings.Contains(controlName, "qmi") {
@@ -1505,6 +1532,9 @@ func enforceDefaultSafeCardPolicy(
 		device.RegionBlockReason(snapshot.IMSI) != "" {
 		return
 	}
+	if entry, err := manager.Get(physicalID); err == nil && modem.IsML307USB(entry.Candidate.VendorID, entry.Candidate.ProductID) {
+		return // Cellular SMS needs RF; do not install the default VoWiFi policy.
+	}
 	iccid := strings.TrimSpace(snapshot.ICCID)
 	if _, err := database.CardPolicy(ctx, iccid); err == nil {
 		return
@@ -1575,6 +1605,9 @@ func reconcileCardPolicies(
 		}
 		mapper := integration.ATMapper{Store: database, Devices: manager}
 		for _, config := range configs {
+			if config.DeviceType == store.DeviceTypeML307 {
+				continue // Do not let an old SIM policy switch cellular SMS back to VoWiFi.
+			}
 			entry, mapErr := mapper.Get(config.ID)
 			if mapErr != nil || entry.Snapshot == nil {
 				if config.DeviceType == store.DeviceTypeUSBSIMReader && observedCards[config.ID] != "missing" {

@@ -265,6 +265,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 		// Newly added hardware starts fail-closed: RF is disabled immediately and
 		// VoWiFi becomes the desired service on supported devices. Native 410
 		// uses its QMI UIM/DMS/NAS adapter; only cellular SMS remains unavailable.
+		// fillConfigFromPhysical selects cellular SMS instead for ML307.
 		config.VoWiFiEnabled = true
 		if isNative410 {
 			config.SMSEnabled = false
@@ -303,16 +304,17 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 		// loop to retry. The stored desired state remains fail-closed (cellular data
 		// disabled, VoWiFi enabled); report the incomplete hardware transition as a
 		// warning while allowing normal reconciliation to finish it later.
+		// ML307 is the exception: cellular SMS requires RF-on, not airplane mode.
 		flightWarning := ""
-		if _, err := s.devices.SetFlight(r.Context(), selected.ID, true); err != nil {
-			flightWarning = "device configuration was saved, but the modem did not enter airplane mode yet; VoCat will retry during recovery"
+		if _, err := s.devices.SetFlight(r.Context(), selected.ID, config.VoWiFiEnabled); err != nil {
+			flightWarning = "device configuration was saved, but the radio mode transition failed; VoCat will retry during recovery"
 			s.logger.Warn("new device saved before initial airplane-mode transition completed",
 				"device_id", config.ID,
 				"physical_device_id", selected.ID,
 				"error", device.HardwareErrorDetail(err),
 			)
 		}
-		if selected.Snapshot != nil {
+		if selected.Snapshot != nil && config.DeviceType != store.DeviceTypeML307 {
 			iccid := strings.TrimSpace(selected.Snapshot.ICCID)
 			if iccid != "" {
 				_, policyErr := s.store.CardPolicy(r.Context(), iccid)
@@ -523,6 +525,10 @@ func (s *Server) handleDevicePath(
 			// VoWiFi/airplane transitions are transactional device actions. A
 			// general config save must not silently bypass their RF-safe ordering.
 			next.VoWiFiEnabled = config.VoWiFiEnabled
+			if next.DeviceType == store.DeviceTypeML307 {
+				next.VoWiFiEnabled = false
+				next.DeviceBackend = "at"
+			}
 			if next.Name == id && strings.TrimSpace(payload.Name) == "" {
 				next.Name = config.Name
 			}
@@ -897,6 +903,10 @@ func (s *Server) handleVoWiFiEnabled(
 	physicalPresent bool,
 ) bool {
 	if !requireMethod(w, r, http.MethodPatch) {
+		return true
+	}
+	if config.DeviceType == store.DeviceTypeML307 {
+		writeError(w, http.StatusNotImplemented, "vowifi_unsupported", "ML307 uses cellular SMS; VoWiFi is not supported")
 		return true
 	}
 	var request struct {
@@ -2370,6 +2380,11 @@ func fillConfigFromPhysical(config *store.Device, entry device.Device) {
 		config.VoWiFiEnabled = true
 	} else if modem.IsDJI4GUSB(candidate.VendorID, candidate.ProductID) {
 		config.DeviceType = store.DeviceTypeDJI4G
+	} else if modem.IsML307USB(candidate.VendorID, candidate.ProductID) {
+		config.DeviceType = store.DeviceTypeML307
+		config.DeviceBackend = "at"
+		config.SMSEnabled = true
+		config.VoWiFiEnabled = false
 	}
 	if config.Interface == "" {
 		config.Interface = candidate.NetworkInterface
@@ -2395,6 +2410,9 @@ func fillConfigFromPhysical(config *store.Device, entry device.Device) {
 }
 
 func discoveredDeviceType(candidate modem.Candidate) string {
+	if modem.IsML307USB(candidate.VendorID, candidate.ProductID) {
+		return store.DeviceTypeML307
+	}
 	if candidate.HardwareKind == "pcsc" {
 		return store.DeviceTypeUSBSIMReader
 	}

@@ -88,7 +88,7 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 		}
 		vendorID := strings.ToLower(readTrimmed(filepath.Join(resolvedDevice, "idVendor")))
 		productID := strings.ToLower(readTrimmed(filepath.Join(resolvedDevice, "idProduct")))
-		if _, bound := qmiBound[deviceName]; !bound && !IsDJI4GUSB(vendorID, productID) {
+		if _, bound := qmiBound[deviceName]; !bound && !IsDJI4GUSB(vendorID, productID) && !IsML307USB(vendorID, productID) {
 			// A bound qmi_wwan interface is the strongest vendor-neutral "this is
 			// a live QMI modem" signal, but it excludes Quectel modules running
 			// in a serial or RNDIS/ECM USB composition (no qmi_wwan binding).
@@ -163,8 +163,20 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 			}
 			return left.Name < right.Name
 		})
-		assignQuectelPortRoles(state.candidate.Ports)
-		state.candidate.ATPort = selectATPort(state.candidate.Ports)
+		if IsML307USB(state.candidate.VendorID, state.candidate.ProductID) {
+			// ML307's AT endpoint is USB interface 02, not necessarily ttyUSB2.
+			for index := range state.candidate.Ports {
+				port := &state.candidate.Ports[index]
+				port.Role = PortRoleUnknown
+				if port.InterfaceNumber == 2 {
+					port.Role = PortRoleAT
+					state.candidate.ATPort = *port
+				}
+			}
+		} else {
+			assignQuectelPortRoles(state.candidate.Ports)
+			state.candidate.ATPort = selectATPort(state.candidate.Ports)
+		}
 		if !state.candidate.HasATPort() {
 			// A modem without a usable AT port cannot be driven by vocat, but it
 			// is far more useful to surface it with a discovery issue than to
@@ -198,6 +210,12 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 func IsDJI4GUSB(vendorID, productID string) bool {
 	return strings.EqualFold(strings.TrimSpace(vendorID), djiVendorID) &&
 		strings.EqualFold(strings.TrimSpace(productID), dji4GProductID)
+}
+
+// IsML307USB identifies the ML307 USB composition with AT on interface 02.
+func IsML307USB(vendorID, productID string) bool {
+	return strings.EqualFold(strings.TrimSpace(vendorID), "2ecc") &&
+		strings.EqualFold(strings.TrimSpace(productID), "3012")
 }
 
 // isQuectelUSBModem reports whether a USB identity belongs to a Quectel

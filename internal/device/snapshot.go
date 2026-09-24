@@ -30,12 +30,20 @@ func (manager *Manager) readSnapshot(
 		OperatingMode: -1,
 		UpdatedAt:     time.Now().UTC(),
 	}
-	ati, err := manager.command(ctx, client, "ATI")
+	ml307 := modem.IsML307USB(candidate.VendorID, candidate.ProductID)
+	probe, iccidCommand, imeiCommand := "ATI", "AT+CCID", "AT+CGSN"
+	if ml307 {
+		probe, iccidCommand, imeiCommand = "AT+CGMM", "AT+MCCID", "AT+CGSN=1"
+	}
+	ati, err := manager.command(ctx, client, probe)
 	if err != nil {
 		return snapshot, fmt.Errorf("probe modem: %w", err)
 	}
 	snapshot.Responsive = true
 	snapshot.Manufacturer, snapshot.Model, snapshot.Firmware = parseATI(ati.Lines)
+	if ml307 {
+		snapshot.Manufacturer, snapshot.Model = candidate.Manufacturer, "ML307"
+	}
 	if snapshot.Model == "" && !strings.EqualFold(candidate.Product, "Android") {
 		snapshot.Model = candidate.Product
 	}
@@ -54,6 +62,9 @@ func (manager *Manager) readSnapshot(
 	}
 
 	optional := func(command string) (modem.Response, bool) {
+		if ml307 && strings.HasPrefix(command, "AT+Q") {
+			return modem.Response{}, false // No Quectel-specific queries on ML307.
+		}
 		response, commandErr := manager.command(ctx, client, command)
 		if commandErr != nil {
 			snapshot.Warnings = append(snapshot.Warnings, commandErr.Error())
@@ -66,7 +77,7 @@ func (manager *Manager) readSnapshot(
 		snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
 	}
 	previousICCID = strings.TrimSpace(previousICCID)
-	if !snapshot.SIMReady && previousICCID != "" {
+	if !ml307 && !snapshot.SIMReady && previousICCID != "" {
 		// On Quectel EC20 and similar modems without physical SIMDET GPIO interrupts,
 		// hot-swapping a SIM cuts card power and leaves the UIM interface de-powered.
 		// A fast soft cycle (AT+CFUN=0 -> AT+CFUN=1/4) re-powers the SIM interface,
@@ -91,8 +102,8 @@ func (manager *Manager) readSnapshot(
 			snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
 		}
 	}
-	ccid, ccidErr := manager.command(ctx, client, "AT+CCID")
-	if ccidErr != nil {
+	ccid, ccidErr := manager.command(ctx, client, iccidCommand)
+	if ccidErr != nil && !ml307 {
 		ccid, ccidErr = manager.command(ctx, client, "AT+QCCID")
 	}
 	if ccidErr != nil && strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) &&
@@ -115,14 +126,16 @@ func (manager *Manager) readSnapshot(
 		snapshot.Warnings = append(snapshot.Warnings, "read ICCID: "+ccidErr.Error())
 	} else {
 		if snapshot.ICCID == "" {
-			snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
+			snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:", "+MCCID:"}, 18, 22)
 		}
 	}
 	if previousICCID != "" && snapshot.ICCID != "" && !strings.EqualFold(previousICCID, snapshot.ICCID) {
 		// A different physical SIM must never inherit the previous card's
 		// permission to use cellular RF. Disable RF before reading serving-cell
 		// or operator state; policy reconciliation will then start VoWiFi.
-		_, _ = manager.command(ctx, client, "AT+CFUN=4")
+		if !ml307 {
+			_, _ = manager.command(ctx, client, "AT+CFUN=4")
+		}
 		snapshot.SIMChanged = true
 	}
 	if response, ok := optional("AT+CIMI"); ok {
@@ -220,7 +233,7 @@ func (manager *Manager) readSnapshot(
 		// device operation behind the lock. Give it an independent short timeout
 		// and let the WWAN transport's drain discard the trailing stale bytes.
 		cgsnCtx, cancelCGSN := context.WithTimeout(ctx, manager.commandTimeout)
-		cgsnResponse, cgsnErr := manager.command(cgsnCtx, client, "AT+CGSN")
+		cgsnResponse, cgsnErr := manager.command(cgsnCtx, client, imeiCommand)
 		cancelCGSN()
 		if cgsnErr == nil {
 			if imei := parseIdentifier(cgsnResponse, []string{"+CGSN:", "+GSN:"}, 14, 17); imei != "" {
@@ -252,9 +265,11 @@ func (manager *Manager) readSnapshot(
 		}
 	}
 
-	phone, warnings := manager.readPhoneNumber(ctx, client)
-	snapshot.Phone = phone
-	snapshot.Warnings = append(snapshot.Warnings, warnings...)
+	if !ml307 {
+		phone, warnings := manager.readPhoneNumber(ctx, client)
+		snapshot.Phone = phone
+		snapshot.Warnings = append(snapshot.Warnings, warnings...)
+	}
 	snapshot.UpdatedAt = time.Now().UTC()
 	return snapshot, nil
 }

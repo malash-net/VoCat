@@ -682,12 +682,14 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		// OpenStick 410 controls cellular registration through QMI but receives
 		// stored SMS through its AT port. Its firmware can reset CNMI after a
 		// profile switch, leaving newly delivered SMS invisible to VoCat.
-		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
+		// ML307 also needs storage notifications rather than direct +CMT delivery.
+		switch store.NormalizeDeviceType(config.DeviceType) {
+		case store.DeviceTypeWiFi410, store.DeviceTypeML307:
 			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
 			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
 			cancelSetup()
 			if setupErr != nil {
-				s.logger.Debug("OpenStick 410 cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
+				s.logger.Debug("cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
 			}
 		}
 		listContext, cancelList := context.WithTimeout(ctx, 30*time.Second)
