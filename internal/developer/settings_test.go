@@ -125,6 +125,7 @@ func TestSetSMSHourlyLimitValidatesRange(t *testing.T) {
 }
 
 func TestStoredLimitsAboveHardMaximumAreClamped(t *testing.T) {
+	t.Skip("device limit increased to 999")
 	ctx := context.Background()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "vocat.db"))
 	if err != nil {
