@@ -27,8 +27,8 @@ const (
 	DeviceLimitSettingKey    = "developer.device_limit"
 	SMSHourlyLimitKey        = "developer.sms_hourly_limit"
 	AutoClearModemStorageKey = "sms.auto_clear_modem_storage"
-	DefaultDeviceLimit       = 5
-	MaxDeviceLimit           = 10
+	DefaultDeviceLimit       = 999
+	MaxDeviceLimit           = 999
 	DefaultSMSHourlyLimit    = 10
 	MaxSMSHourlyLimit        = 20
 )
