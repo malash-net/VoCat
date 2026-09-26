@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"strings"
 	"sync"
@@ -47,12 +48,12 @@ func (value IncomingCallNotification) Text() string {
 		envText = "基站直连"
 	}
 	return strings.Join([]string{
-		"📞 收到来电",
-		"设备  " + value.DeviceLabel,
-		"来电号码  " + value.Caller,
-		"被呼号码  " + value.Called,
-		"时间  " + value.Time.Local().Format("2006-01-02 15:04:05"),
-		"网络  " + envText,
+		"<b>📞 收到来电</b>",
+		"",
+		"SIM卡槽: " + html.EscapeString(value.DeviceLabel),
+		"来自: " + html.EscapeString(value.Caller),
+		"呼入: " + html.EscapeString(value.Called),
+		"网络: " + envText,
 	}, "\n")
 }
 
