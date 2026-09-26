@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2283,8 +2284,8 @@ func (bot *telegramBot) sendSMSNotification(ctx context.Context, config telegram
 	if !notificationMatchesDevice(config.DeviceIDs, notification.DeviceID) {
 		return nil
 	}
-	text := notification.TelegramText()
-	return bot.sendText(ctx, config, 0, text, nil)
+	text := fmt.Sprintf("<b>%s</b>\n\nSIM卡槽: %s\n来自: %s", html.EscapeString(notification.Content), html.EscapeString(notification.DeviceLabel), html.EscapeString(notification.Number))
+	return bot.call(ctx, config, "sendMessage", map[string]any{"chat_id": config.ChatID, "text": text, "parse_mode": "HTML"}, nil)
 }
 
 func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
