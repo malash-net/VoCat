@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2295,8 +2296,9 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 						cursor = message.ID
 						continue
 					}
-					text := fmt.Sprintf("📩 新短信\n设备：%s\n来自：%s\n时间：%s\n\n%s", message.DeviceID, message.Peer, message.Timestamp.Local().Format("2006-01-02 15:04:05"), message.Body)
-					if sendErr := bot.sendText(ctx, config, 0, text, nil); sendErr != nil {
+					notification := bot.server.newSMSNotification(ctx, message)
+					text := fmt.Sprintf("<b>%s</b>\n\nSIM卡槽: %s\n来自: %s", html.EscapeString(notification.Content), html.EscapeString(notification.DeviceLabel), html.EscapeString(notification.Number))
+					if sendErr := bot.call(ctx, config, "sendMessage", map[string]any{"chat_id": config.ChatID, "text": text, "parse_mode": "HTML"}, nil); sendErr != nil {
 						bot.warn("send Telegram SMS notification", sendErr)
 						break
 					}
