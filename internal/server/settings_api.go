@@ -768,8 +768,9 @@ func sendTelegramNotificationTest(ctx context.Context, config map[string]any) er
 		return err
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"chat_id": configString(config, "chat_id"),
-		"text":    "vocat notification test",
+		"chat_id":    configString(config, "chat_id"),
+		"text":       "<b>✅ Telegram 通知测试成功</b>\n\nVoCat 通知已连接。",
+		"parse_mode": "HTML",
 	})
 	request, err := http.NewRequestWithContext(
 		ctx,
