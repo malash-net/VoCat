@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -36,24 +37,25 @@ func (s *Server) notifyAutomaticTask(ctx context.Context, task store.AutomaticTa
 	if configured, err := s.store.Device(ctx, task.DeviceID); err == nil {
 		deviceLabel = firstNonEmpty(configured.Name, configured.ID)
 	}
-	status := "成功"
+	title := "✅ 自动任务执行成功"
 	detail := firstNonEmpty(run.Output, "任务已完成")
 	if run.Status != "success" {
-		status = "失败"
-		detail = firstNonEmpty(run.Error, "未知错误")
+		title = "❌ 自动任务执行失败"
+		detail = "原因: " + firstNonEmpty(run.Error, "未知错误")
 	}
 	taskType := map[string]string{"sms": "发送短信", "call": "拨打电话", "public_ip": "获取漫游公网 IP"}[task.TaskType]
 	environment := map[string]string{"vowifi": "VoWiFi", "cellular": "基站直连"}[task.Environment]
 	notification := automaticTaskNotification{
-		Title: "自动任务执行" + status,
+		Title: title,
 		Text: strings.Join([]string{
-			"自动任务执行" + status,
-			"任务  " + task.Name,
-			"设备  " + deviceLabel,
-			"类型  " + firstNonEmpty(taskType, task.TaskType),
-			"环境  " + firstNonEmpty(environment, task.Environment),
-			"时间  " + run.FinishedAt.Local().Format("2006-01-02 15:04:05"),
-			"结果  " + detail,
+			"<b>" + title + "</b>",
+			"",
+			"SIM卡槽: " + html.EscapeString(deviceLabel),
+			"任务: " + html.EscapeString(task.Name),
+			"类型: " + html.EscapeString(firstNonEmpty(taskType, task.TaskType)),
+			"网络: " + html.EscapeString(firstNonEmpty(environment, task.Environment)),
+			"",
+			html.EscapeString(detail),
 		}, "\n"),
 		Time: run.FinishedAt, Task: task, Run: run,
 	}
@@ -108,7 +110,7 @@ func sendTelegramTextNotification(ctx context.Context, config map[string]any, te
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(map[string]any{"chat_id": configString(config, "chat_id"), "text": text})
+	payload, _ := json.Marshal(map[string]any{"chat_id": configString(config, "chat_id"), "text": text, "parse_mode": "HTML"})
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, parsed.String(), bytes.NewReader(payload))
 	if err != nil {
 		return err
