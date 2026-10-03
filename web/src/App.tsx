@@ -121,7 +121,7 @@ function AppRoot() {
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-      {showDisclaimer && <Disclaimer firstTime={firstTime} onAgree={agree} />}
+      {false && showDisclaimer && <Disclaimer firstTime={firstTime} onAgree={agree} />}
     </div>
   );
 }
