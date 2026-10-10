@@ -57,10 +57,38 @@ func (c *lenientATClient) saw(command string) bool {
 	return false
 }
 
-// AT+CGSN on some MHI modems returns the IMEI line but never a final OK, so it
-// would block until the caller's deadline and hold the device lock for the
-// whole periodic refresh. The snapshot must bound CGSN with its own short
-// timeout instead of inheriting the refresh deadline.
+func TestNativeSnapshotSkipsCGSNAndPreservesIMEICache(t *testing.T) {
+	const cachedIMEI = "867123456789012"
+	for _, test := range []struct {
+		name      string
+		candidate modem.Candidate
+		dmsErr    error
+		wantIMEI  string
+	}{
+		{name: "DMS success with AT backend", candidate: modem.Candidate{ID: "mhi-wwan0", QMIControl: "/dev/wwan0qmi0"}, wantIMEI: "861716070416510"},
+		{name: "DMS failure keeps cache", candidate: modem.Candidate{ID: "mhi-wwan0", QMIControl: "/dev/wwan0qmi0"}, dmsErr: errors.New("DMS failed"), wantIMEI: cachedIMEI},
+		{name: "native without QMI keeps cache", candidate: modem.Candidate{HardwareKind: "wwan"}, wantIMEI: cachedIMEI},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &lenientATClient{cgsnIMEI: "866241014372802"}
+			session := &fakeQMIRadioSession{imei: "861716070416510", imeiErr: test.dmsErr}
+			manager := &Manager{commandTimeout: time.Second, qmiRadioOpener: func(context.Context, string) (qmiRadioSession, error) {
+				return session, nil
+			}}
+			snapshot, err := manager.readSnapshot(context.Background(), test.candidate.ID, test.candidate, "at", "", &Snapshot{IMEI: cachedIMEI}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.saw("AT+CGSN") || client.saw("AT+CGSN=1") {
+				t.Fatalf("native AT IMEI probe issued: %v", client.commands)
+			}
+			if snapshot.IMEI != test.wantIMEI {
+				t.Fatalf("IMEI = %q, want %q", snapshot.IMEI, test.wantIMEI)
+			}
+		})
+	}
+}
+
 func TestManagerRefreshBoundsCGSNTimeout(t *testing.T) {
 	client := &lenientATClient{cgsnDelay: 5 * time.Second}
 	manager, id := newStartedTestManager(t, client)
@@ -92,9 +120,6 @@ func TestManagerRefreshBoundsCGSNTimeout(t *testing.T) {
 // card that call blocks until its long timeout and starves the AT terminal
 // behind the device lock.
 func TestManagerRefreshSkipsQMIICCIDWithoutReadySIM(t *testing.T) {
-	// CGSN succeeds so the snapshot does not fall back to the QMI DMS IMEI
-	// read either; the test focuses on the UIM ICCID fallback being skipped
-	// without a READY card.
 	client := &lenientATClient{cgsnIMEI: "866241014372802"}
 	manager, err := NewManager(Options{
 		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
@@ -133,6 +158,9 @@ func TestManagerRefreshSkipsQMIICCIDWithoutReadySIM(t *testing.T) {
 	// without a READY SIM, must be skipped.
 	if qmiCalls != 1 {
 		t.Fatalf("qmiRadioOpener called %d times, want 1 (DMS IMEI only, UIM ICCID must be skipped without a READY SIM)", qmiCalls)
+	}
+	if client.saw("AT+CGSN") || client.saw("AT+CGSN=1") || snapshot.IMEI != "" {
+		t.Fatalf("native IMEI fell back to AT: %q, commands = %v", snapshot.IMEI, client.commands)
 	}
 	for _, warning := range snapshot.Warnings {
 		if strings.Contains(warning, "QMI UIM") {

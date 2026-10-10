@@ -47,10 +47,8 @@ func (manager *Manager) readSnapshot(
 	} else if snapshot.Model == "" && !strings.EqualFold(candidate.Product, "Android") {
 		snapshot.Model = candidate.Product
 	}
-	// Native MHI/QMI devices expose their immutable modem identity through DMS.
-	// Read it before any SIM-dependent AT probes: a missing/bad card can make
-	// those commands slow or fail, but must never prevent IMEI from appearing.
-	if strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
+	nativeWWAN := candidate.HardwareKind == "wwan" || isNativeQMICandidate(candidate)
+	if isNativeQMICandidate(candidate) {
 		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
 		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
 		cancelQMI()
@@ -252,12 +250,7 @@ func (manager *Manager) readSnapshot(
 		snapshot.RegistrationStatus = 1
 		snapshot.RegistrationSource = "COPS"
 	}
-	if snapshot.IMEI == "" {
-		// AT+CGSN on some MHI modems (the UFI dongle behind the OpenStick 410)
-		// returns the IMEI line but never a final OK, so it would block until the
-		// caller's deadline (30s during a periodic refresh) and starve every other
-		// device operation behind the lock. Give it an independent short timeout
-		// and let the WWAN transport's drain discard the trailing stale bytes.
+	if snapshot.IMEI == "" && !nativeWWAN {
 		for _, command := range []string{"AT+CGSN", "AT+CGSN=1"} {
 			cgsnCtx, cancelCGSN := context.WithTimeout(ctx, manager.commandTimeout)
 			cgsnResponse, cgsnErr := manager.command(cgsnCtx, client, command)
@@ -268,16 +261,6 @@ func (manager *Manager) readSnapshot(
 					break
 				}
 			}
-		}
-	}
-	if snapshot.IMEI == "" && strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
-		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
-		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
-		cancelQMI()
-		if qmiErr == nil {
-			snapshot.IMEI = qmiIMEI
-		} else {
-			snapshot.Warnings = append(snapshot.Warnings, "read IMEI via QMI DMS: "+qmiErr.Error())
 		}
 	}
 	if snapshot.IMEI == "" && previousSnapshot != nil {

@@ -429,10 +429,16 @@ func (manager *Manager) ReconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 	rebootContext, cancelReboot := context.WithTimeout(ctx, manager.longTimeout)
 	_, rebootErr := client.Execute(rebootContext, "AT+CFUN=1,1")
 	cancelReboot()
-	_ = client.Close()
-	state.client = nil
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
+	rebootErr = clientCommandError(client, rebootErr)
+	if errors.Is(rebootErr, modem.ErrSessionUnsynchronized) {
+		manager.setResult(id, state, nil, rebootErr)
+		state.opMu.Unlock()
+		return fmt.Errorf("restart EC20 after MBN selection: %w", rebootErr)
+	}
+	_ = client.Close()
+	state.client = nil
 	state.opMu.Unlock()
 
 	if manager.logger != nil {

@@ -383,6 +383,9 @@ func (manager *Manager) recoverOperatingModeAfterTransportLoss(
 	target int,
 	commandErr error,
 ) (modem.Client, int, error) {
+	if errors.Is(commandErr, modem.ErrSessionUnsynchronized) {
+		return nil, 0, commandErr
+	}
 	poisoned, ok := client.(modem.PoisonedClient)
 	if !ok || !poisoned.Poisoned() {
 		return nil, 0, commandErr
@@ -399,6 +402,9 @@ func (manager *Manager) recoverOperatingModeAfterTransportLoss(
 		reopened, err := manager.clientLocked(recoveryCtx, state, manager.candidateFor(state))
 		if err == nil {
 			mode, readErr := manager.readOperatingMode(recoveryCtx, reopened)
+			if errors.Is(readErr, modem.ErrSessionUnsynchronized) {
+				return nil, 0, readErr
+			}
 			if readErr == nil && mode == target {
 				return reopened, mode, nil
 			}
@@ -412,6 +418,9 @@ func (manager *Manager) recoverOperatingModeAfterTransportLoss(
 				state.client = nil
 			}
 		} else {
+			if errors.Is(err, modem.ErrSessionUnsynchronized) {
+				return nil, 0, err
+			}
 			lastErr = err
 		}
 

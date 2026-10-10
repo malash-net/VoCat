@@ -25,10 +25,6 @@ func (opener SerialOpener) Open(ctx context.Context, port Port) (Client, error) 
 		if err != nil {
 			return nil, fmt.Errorf("open WWAN AT port %s: %w", path, err)
 		}
-		if err := rawPort.ResetInputBuffer(); err != nil {
-			_ = rawPort.Close()
-			return nil, fmt.Errorf("reset WWAN AT input buffer %s: %w", path, err)
-		}
 		session, err := NewSession(rawPort, opener.SessionOptions)
 		if err != nil {
 			_ = rawPort.Close()
@@ -43,10 +39,6 @@ func (opener SerialOpener) Open(ctx context.Context, port Port) (Client, error) 
 	rawPort, err := openSerialTransport(path, baudRate)
 	if err != nil {
 		return nil, fmt.Errorf("open AT port %s: %w", path, err)
-	}
-	if err := rawPort.ResetInputBuffer(); err != nil {
-		_ = rawPort.Close()
-		return nil, fmt.Errorf("reset AT input buffer %s: %w", path, err)
 	}
 	session, err := NewSession(rawPort, opener.SessionOptions)
 	if err != nil {

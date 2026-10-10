@@ -15,7 +15,6 @@ import (
 type Transport interface {
 	io.ReadWriteCloser
 	Drain() error
-	ResetInputBuffer() error
 	SetReadTimeout(time.Duration) error
 }
 
@@ -38,26 +37,31 @@ func (options SessionOptions) withDefaults() SessionOptions {
 	return options
 }
 
-// Session serializes commands for one physical AT port. Reading is intentionally
-// performed under the same mutex as writing: this prevents two callers from
-// consuming each other's responses while still allowing interleaved URCs to be
-// separated and queued.
 type Session struct {
-	mu        sync.Mutex
+	lifetime  context.Context
+	cancel    context.CancelFunc
 	transport Transport
 	options   SessionOptions
-	readBuf   []byte
-	urcs      []string
-	closed    bool
-	poisoned  bool
+	requests  chan *atRequest
+	received  chan atReadBatch
+	stop      chan struct{}
+	stopOnce  sync.Once
+	closeOnce sync.Once
+	workers   sync.WaitGroup
+
+	mu         sync.Mutex
+	closed     bool
+	failure    error
+	closeErr   error
+	urcs       []string
+	urcChanged chan struct{}
 }
 
-// PoisonedClient is implemented by Session. A poisoned session has hit a
-// transport-fatal error (a failed write/drain/read or a closed serial line);
-// the underlying fd is wedged and every subsequent command reuses the corpse.
-// AT-level failures (CommandError) do not poison. A command deadline that has
-// to close a blocked transport does poison, because the fd was wedged and must
-// be reopened before the next operation.
+type atReadBatch struct {
+	data []byte
+	err  error
+}
+
 type PoisonedClient interface {
 	Poisoned() bool
 }
@@ -70,18 +74,27 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 	if err := transport.SetReadTimeout(options.ReadTimeout); err != nil {
 		return nil, fmt.Errorf("set serial read timeout: %w", err)
 	}
-	return &Session{
-		transport: transport,
-		options:   options,
-	}, nil
+	lifetime, cancel := context.WithCancel(context.Background())
+	session := &Session{
+		lifetime:   lifetime,
+		cancel:     cancel,
+		transport:  transport,
+		options:    options,
+		requests:   make(chan *atRequest, 16),
+		received:   make(chan atReadBatch, 8),
+		stop:       make(chan struct{}),
+		urcChanged: make(chan struct{}),
+	}
+	session.workers.Add(2)
+	go session.readLoop()
+	go session.runLoop()
+	return session, nil
 }
 
-// Poisoned reports whether this session has hit a transport-fatal error and
-// should be discarded rather than reused. It is safe to call concurrently.
 func (session *Session) Poisoned() bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.poisoned || session.closed
+	return session.stopped() && !errors.Is(session.failure, ErrSessionUnsynchronized)
 }
 
 func (session *Session) Execute(ctx context.Context, command string) (Response, error) {
@@ -89,25 +102,10 @@ func (session *Session) Execute(ctx context.Context, command string) (Response, 
 	if err != nil {
 		return Response{}, err
 	}
-	ctx, cancel := session.commandContext(ctx)
-	defer cancel()
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed {
-		return Response{}, ErrSessionClosed
-	}
-	return session.executeLocked(ctx, command)
+	return session.submit(ctx, command, nil, false)
 }
 
-// ExecutePrompt executes the controlled two-phase AT+CMGS transaction. It does
-// not release the session mutex between the command, the '>' prompt, the
-// payload terminator, and the final result.
-func (session *Session) ExecutePrompt(
-	ctx context.Context,
-	command string,
-	payload []byte,
-) (Response, error) {
+func (session *Session) ExecutePrompt(ctx context.Context, command string, payload []byte) (Response, error) {
 	command, err := normalizeATCommand(command)
 	if err != nil {
 		return Response{}, err
@@ -121,385 +119,262 @@ func (session *Session) ExecutePrompt(
 	if bytes.IndexByte(payload, 0x1a) >= 0 || bytes.IndexByte(payload, 0x1b) >= 0 {
 		return Response{}, errors.New("modem: prompt payload contains a terminator")
 	}
+	return session.submit(ctx, command, append([]byte(nil), payload...), true)
+}
+
+func (session *Session) submit(ctx context.Context, command string, payload []byte, interactive bool) (Response, error) {
 	ctx, cancel := session.commandContext(ctx)
 	defer cancel()
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed {
-		return Response{}, ErrSessionClosed
+	if err := ctx.Err(); err != nil {
+		return failedResponse(command, commandContextError(err))
 	}
-	return session.executePromptLocked(ctx, command, payload)
+	if err := session.Err(); err != nil {
+		return failedResponse(command, err)
+	}
+	request := newATRequest(ctx, command, payload, interactive)
+	select {
+	case session.requests <- request:
+	case <-ctx.Done():
+		return failedResponse(command, commandContextError(ctx.Err()))
+	case <-session.stop:
+		return failedResponse(command, session.Err())
+	}
+	select {
+	case <-request.done:
+		result := request.resultSnapshot(nil)
+		return result.response, result.err
+	case <-ctx.Done():
+		result := request.canceledResult(commandContextError(ctx.Err()))
+		return result.response, result.err
+	case <-session.stop:
+		result := request.resultSnapshot(session.Err())
+		return result.response, result.err
+	}
 }
 
 func (session *Session) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, ok := ctx.Deadline(); ok || session.options.CommandTimeout <= 0 {
+	if _, ok := ctx.Deadline(); ok {
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, session.options.CommandTimeout)
 }
 
-func (session *Session) executeLocked(ctx context.Context, command string) (Response, error) {
-	started := time.Now()
-	response := Response{Command: command}
-	if err := ctx.Err(); err != nil {
-		return response, err
-	}
-	// Drain the transport before writing the command. Serial transports wait
-	// for any pending output here (a no-op after a synchronous command), while
-	// WWAN transports discard bytes left over from a previous command that
-	// timed out; without this, a late reply (e.g. a slow CGSN response) would
-	// be mis-parsed as this command's output.
-	if err := drainTransport(ctx, session.transport); err != nil {
-		session.poisonLocked()
-		return response, fmt.Errorf("drain %s: %w", command, err)
-	}
-	if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
-		session.poisonLocked()
-		return response, fmt.Errorf("write %s: %w", command, err)
-	}
-	return session.readFinalLocked(ctx, started, command, "", response)
-}
-
-// poisonLocked marks the session unusable after a transport-fatal error. Held
-// under session.mu by the caller; idempotent.
-func (session *Session) poisonLocked() {
-	session.poisoned = true
-}
-
-func (session *Session) executePromptLocked(
-	ctx context.Context,
-	command string,
-	payload []byte,
-) (Response, error) {
-	started := time.Now()
-	response := Response{Command: command}
-	if err := ctx.Err(); err != nil {
-		return response, err
-	}
-	if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
-		session.poisonLocked()
-		return response, fmt.Errorf("write %s: %w", command, err)
-	}
-	if err := drainTransport(ctx, session.transport); err != nil {
-		session.poisonLocked()
-		return response, fmt.Errorf("drain %s: %w", command, err)
-	}
-	if err := session.waitPromptLocked(ctx, command, &response); err != nil {
-		response.Duration = time.Since(started)
-		return response, session.normalizeReadError(command, err)
-	}
-	if err := ctx.Err(); err != nil {
-		session.abortPromptLocked()
-		response.Duration = time.Since(started)
-		return response, err
-	}
-	if err := writeAll(session.transport, payload); err != nil {
-		session.poisonLocked()
-		session.abortPromptLocked()
-		response.Duration = time.Since(started)
-		return response, fmt.Errorf("write %s payload: %w", command, err)
-	}
-	if err := writeAll(session.transport, []byte{0x1a}); err != nil {
-		session.poisonLocked()
-		session.abortPromptLocked()
-		response.Duration = time.Since(started)
-		return response, fmt.Errorf("terminate %s payload: %w", command, err)
-	}
-	if err := drainTransport(ctx, session.transport); err != nil {
-		session.poisonLocked()
-		response.Duration = time.Since(started)
-		return response, fmt.Errorf("drain %s payload: %w", command, err)
-	}
-	return session.readFinalLocked(ctx, started, command, string(payload), response)
-}
-
-// drainTransport retries tcdrain/TCSBRK when the kernel interrupts it with a
-// signal. go.bug.st/serial already retries EINTR for Read, but its Linux
-// Drain implementation currently returns the transient error directly.
-func drainTransport(ctx context.Context, transport Transport) error {
-	for {
-		err := transport.Drain()
-		if !errors.Is(err, syscall.EINTR) {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	}
-}
-
-func (session *Session) readFinalLocked(
-	ctx context.Context,
-	started time.Time,
-	command string,
-	payloadEcho string,
-	response Response,
-) (Response, error) {
-	expectedPrefix := expectedResponsePrefix(command)
-	for {
-		line, err := session.readLineLocked(ctx)
-		if err != nil {
-			response.Duration = time.Since(started)
-			return response, session.normalizeReadError(command, err)
-		}
-		line = strings.TrimSpace(strings.Trim(line, "\x00"))
-		if line == "" || strings.EqualFold(line, command) ||
-			(payloadEcho != "" && line == payloadEcho) {
-			continue
-		}
-		if isFinalResult(line) {
-			response.Final = line
-			response.Duration = time.Since(started)
-			if response.OK() {
-				return response, nil
-			}
-			return response, &CommandError{
-				Command: command,
-				Final:   line,
-				Lines:   append([]string(nil), response.Lines...),
-			}
-		}
-		if isURC(line) && !strings.HasPrefix(strings.ToUpper(line), expectedPrefix) {
-			response.URCs = append(response.URCs, line)
-			session.enqueueURCLocked(line)
-			continue
-		}
-		response.Lines = append(response.Lines, line)
-	}
-}
-
-func (session *Session) waitPromptLocked(
-	ctx context.Context,
-	command string,
-	response *Response,
-) error {
-	expectedPrefix := expectedResponsePrefix(command)
-	for {
-		if index := promptIndex(session.readBuf); index >= 0 {
-			prefix := string(session.readBuf[:index])
-			session.readBuf = session.readBuf[index+1:]
-			for len(session.readBuf) > 0 &&
-				(session.readBuf[0] == ' ' || session.readBuf[0] == '\t') {
-				session.readBuf = session.readBuf[1:]
-			}
-			for _, line := range strings.FieldsFunc(prefix, func(character rune) bool {
-				return character == '\r' || character == '\n'
-			}) {
-				if err := session.consumePromptLineLocked(
-					command,
-					expectedPrefix,
-					line,
-					response,
-				); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		if line, ok := popLine(&session.readBuf); ok {
-			if err := session.consumePromptLineLocked(
-				command,
-				expectedPrefix,
-				line,
-				response,
-			); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		buffer := make([]byte, 1024)
-		count, err := readTransportContext(ctx, session.transport, buffer)
-		if count > 0 {
-			session.readBuf = append(session.readBuf, buffer[:count]...)
-			continue
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) && session.closed {
-				return ErrSessionClosed
-			}
-			session.poisonLocked()
-			return fmt.Errorf("read serial prompt: %w", err)
-		}
-	}
-}
-
-func promptIndex(buffer []byte) int {
-	for index, character := range buffer {
-		if character != '>' {
-			continue
-		}
-		if index == 0 || buffer[index-1] == '\r' || buffer[index-1] == '\n' {
-			return index
-		}
-	}
-	return -1
-}
-
-func (session *Session) consumePromptLineLocked(
-	command string,
-	expectedPrefix string,
-	line string,
-	response *Response,
-) error {
-	line = strings.TrimSpace(strings.Trim(line, "\x00"))
-	if line == "" || strings.EqualFold(line, command) {
-		return nil
-	}
-	if isFinalResult(line) {
-		response.Final = line
-		if response.OK() {
-			return fmt.Errorf("%w: %s", ErrPromptNotReceived, command)
-		}
-		return &CommandError{
-			Command: command,
-			Final:   line,
-			Lines:   append([]string(nil), response.Lines...),
-		}
-	}
-	if isURC(line) && !strings.HasPrefix(strings.ToUpper(line), expectedPrefix) {
-		response.URCs = append(response.URCs, line)
-		session.enqueueURCLocked(line)
-		return nil
-	}
-	response.Lines = append(response.Lines, line)
-	return nil
-}
-
-func (session *Session) normalizeReadError(command string, err error) error {
-	if errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, context.Canceled) {
-		_ = session.transport.ResetInputBuffer()
-		session.readBuf = nil
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("%w: %s", ErrCommandTimeout, command)
-		}
+func commandContextError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.Join(ErrCommandTimeout, err)
 	}
 	return err
 }
 
-func (session *Session) abortPromptLocked() {
-	_ = writeAll(session.transport, []byte{0x1b})
-	_ = session.transport.Drain()
-	_ = session.transport.ResetInputBuffer()
-	session.readBuf = nil
+func failedResponse(command string, err error) (Response, error) {
+	return Response{Command: command}, err
 }
 
-// WaitURC waits for an unsolicited result matching predicate. Non-matching URCs
-// remain queued for another consumer.
-func (session *Session) WaitURC(
-	ctx context.Context,
-	predicate func(string) bool,
-) (string, error) {
+func (session *Session) readLoop() {
+	defer session.workers.Done()
+	buffer := make([]byte, 1024)
+	for {
+		select {
+		case <-session.stop:
+			return
+		default:
+		}
+		count, err := session.transport.Read(buffer)
+		if count == 0 && errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if count == 0 && err == nil {
+			continue
+		}
+		batch := atReadBatch{err: err}
+		if count > 0 {
+			batch.data = append([]byte(nil), buffer[:count]...)
+		}
+		if err != nil {
+			session.mu.Lock()
+			if !session.closed && session.failure == nil {
+				session.failure = fmt.Errorf("read serial response: %w", err)
+			}
+			session.mu.Unlock()
+		}
+		select {
+		case session.received <- batch:
+		case <-session.stop:
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (session *Session) enqueueURC(lines []string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed {
+		return
+	}
+	text := strings.Join(lines, "\n")
+	if len(session.urcs) >= session.options.MaxURCs {
+		copy(session.urcs, session.urcs[1:])
+		session.urcs[len(session.urcs)-1] = text
+	} else {
+		session.urcs = append(session.urcs, text)
+	}
+	close(session.urcChanged)
+	session.urcChanged = make(chan struct{})
+}
+
+// WaitURC blocks until a stored URC matches predicate, returns that text,
+// and removes the URC from the buffer. The predicate runs while the session
+// mutex is held, so it must not call back into the session.
+func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool) (string, error) {
 	if predicate == nil {
 		return "", errors.New("modem: URC predicate is required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed {
-		return "", ErrSessionClosed
-	}
-
-	for index, line := range session.urcs {
-		if predicate(line) {
-			session.urcs = append(session.urcs[:index], session.urcs[index+1:]...)
-			return line, nil
-		}
-	}
 	for {
-		line, err := session.readLineLocked(ctx)
-		if err != nil {
-			return "", err
-		}
-		line = strings.TrimSpace(strings.Trim(line, "\x00"))
-		if line == "" {
-			continue
-		}
-		if predicate(line) {
-			return line, nil
-		}
-		session.enqueueURCLocked(line)
-	}
-}
-
-func (session *Session) enqueueURCLocked(line string) {
-	if len(session.urcs) >= session.options.MaxURCs {
-		copy(session.urcs, session.urcs[1:])
-		session.urcs[len(session.urcs)-1] = line
-		return
-	}
-	session.urcs = append(session.urcs, line)
-}
-
-func (session *Session) readLineLocked(ctx context.Context) (string, error) {
-	for {
-		if line, ok := popLine(&session.readBuf); ok {
-			return line, nil
-		}
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		buffer := make([]byte, 1024)
-		count, err := readTransportContext(ctx, session.transport, buffer)
-		if count > 0 {
-			session.readBuf = append(session.readBuf, buffer[:count]...)
-			continue
+		session.mu.Lock()
+		if session.closed {
+			err := session.unavailableErrorLocked()
+			session.mu.Unlock()
+			return "", err
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) && session.closed {
-				return "", ErrSessionClosed
+		for index, text := range session.urcs {
+			if predicate(text) {
+				session.urcs = append(session.urcs[:index], session.urcs[index+1:]...)
+				session.mu.Unlock()
+				return text, nil
 			}
-			session.poisonLocked()
-			return "", fmt.Errorf("read serial response: %w", err)
+		}
+		failure := session.unavailableErrorLocked()
+		notify := session.urcChanged
+		session.mu.Unlock()
+		if failure != nil {
+			return "", failure
+		}
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-session.stop:
+			return "", session.Err()
 		}
 	}
 }
 
-// readTransportContext checks cancellation around one bounded transport read.
-// It must not close a transport from another goroutine: some serial libraries
-// wait in Close for the active reader while that reader is itself stuck in a
-// blocking read(2), deadlocking the session and every caller queued behind it.
-// Linux serial transports therefore keep their fd non-blocking and enforce the
-// configured read timeout with poll(2).
-func readTransportContext(
-	ctx context.Context,
-	transport Transport,
-	buffer []byte,
-) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	count, err := transport.Read(buffer)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return 0, contextErr
-	}
-	return count, err
+func (session *Session) Err() error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.unavailableErrorLocked()
 }
 
-func popLine(buffer *[]byte) (string, bool) {
-	data := *buffer
-	for index, character := range data {
-		if character != '\r' && character != '\n' {
+func (session *Session) unavailableErrorLocked() error {
+	if session.failure != nil {
+		if errors.Is(session.failure, ErrSessionUnsynchronized) && !session.closed {
+			return session.failure
+		}
+		return errors.Join(ErrSessionClosed, session.failure)
+	}
+	if session.closed {
+		return ErrSessionClosed
+	}
+	return nil
+}
+
+func (session *Session) beginRequest(request *atRequest) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if err := session.unavailableErrorLocked(); err != nil {
+		return err
+	}
+	request.mu.Lock()
+	defer request.mu.Unlock()
+	if err := request.ctx.Err(); err != nil {
+		return commandContextError(err)
+	}
+	if request.completed {
+		return ErrSessionClosed
+	}
+	request.started = time.Now()
+	return nil
+}
+
+func (session *Session) failProtocol(reason string, cause error) {
+	session.mu.Lock()
+	if !session.closed && !errors.Is(session.failure, ErrSessionUnsynchronized) {
+		session.failure = errors.Join(fmt.Errorf("%w: %s", ErrSessionUnsynchronized, reason), cause)
+	}
+	failure := session.failure
+	session.mu.Unlock()
+	if failure != nil {
+		session.terminate(failure, false)
+	}
+}
+
+func (session *Session) stopped() bool {
+	select {
+	case <-session.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (session *Session) terminate(err error, explicit bool) {
+	session.mu.Lock()
+	if explicit {
+		session.closed = true
+	}
+	if err != nil && session.failure == nil {
+		session.failure = err
+	}
+	// A closed stop channel wakes every pending WaitURC and submit; the
+	// unavailableError check inside them returns before they can select on
+	// urcChanged again, so nothing needs resetting here.
+	session.stopOnce.Do(func() {
+		session.cancel()
+		close(session.stop)
+	})
+	session.mu.Unlock()
+	session.closeOnce.Do(func() {
+		closeErr := session.transport.Close()
+		session.mu.Lock()
+		session.closeErr = closeErr
+		session.mu.Unlock()
+	})
+}
+
+func (session *Session) Close() error {
+	session.terminate(nil, true)
+	session.workers.Wait()
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.closeErr
+}
+
+func drainTransport(ctx context.Context, transport Transport) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := transport.Drain()
+		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
-		line := string(data[:index])
-		next := index + 1
-		for next < len(data) && (data[next] == '\r' || data[next] == '\n') {
-			next++
+		if err == nil {
+			err = ctx.Err()
 		}
-		*buffer = data[next:]
-		return line, true
+		return err
 	}
-	return "", false
 }
 
 func normalizeATCommand(command string) (string, error) {
@@ -522,7 +397,6 @@ func normalizeATCommand(command string) (string, error) {
 func expectedResponsePrefix(command string) string {
 	upper := strings.ToUpper(strings.TrimSpace(command))
 	if strings.HasPrefix(upper, "AT+CUSD=") {
-		// +CUSD is asynchronous even when it arrives before the command's OK.
 		return "\x00"
 	}
 	body := strings.TrimPrefix(upper, "AT")
@@ -543,42 +417,38 @@ func expectedResponsePrefix(command string) string {
 	return name + ":"
 }
 
+var urcPrefixes = [...]string{
+	"+CMTI:", "+CMT:", "+CDS:", "+CREG:", "+CGREG:", "+CEREG:",
+	"+CUSD:", "+CLIP:", "+CRING:", "CIEV:", "+CIEV:", "+QIND:", "+QIURC:",
+	"+QSIMSTAT:", "+QUSIM:", "+QNWINFO:",
+}
+
+func normalizeATLine(line string) string {
+	return strings.ToUpper(strings.TrimSpace(line))
+}
+
 func isFinalResult(line string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(line))
-	return upper == "OK" ||
-		upper == "ERROR" ||
-		upper == "NO CARRIER" ||
-		upper == "BUSY" ||
-		upper == "NO ANSWER" ||
-		strings.HasPrefix(upper, "+CME ERROR:") ||
-		strings.HasPrefix(upper, "+CMS ERROR:")
+	upper := normalizeATLine(line)
+	return upper == "OK" || upper == "ERROR" ||
+		strings.HasPrefix(upper, "+CME ERROR:") || strings.HasPrefix(upper, "+CMS ERROR:")
+}
+
+func isCallResult(line string) bool {
+	switch normalizeATLine(line) {
+	case "NO CARRIER", "BUSY", "NO ANSWER":
+		return true
+	default:
+		return false
+	}
 }
 
 func isURC(line string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(line))
-	if upper == "RING" ||
-		upper == "RDY" ||
-		upper == "CALL READY" ||
-		upper == "SMS READY" ||
-		upper == "PB DONE" {
+	upper := normalizeATLine(line)
+	if upper == "RING" || upper == "RDY" || upper == "CALL READY" ||
+		upper == "SMS READY" || upper == "PB DONE" {
 		return true
 	}
-	for _, prefix := range []string{
-		"+CMTI:",
-		"+CMT:",
-		"+CDS:",
-		"+CREG:",
-		"+CGREG:",
-		"+CEREG:",
-		"+CUSD:",
-		"+CLIP:",
-		"+CRING:",
-		"+QIND:",
-		"+QIURC:",
-		"+QSIMSTAT:",
-		"+QUSIM:",
-		"+QNWINFO:",
-	} {
+	for _, prefix := range urcPrefixes {
 		if strings.HasPrefix(upper, prefix) {
 			return true
 		}
@@ -586,29 +456,27 @@ func isURC(line string) bool {
 	return false
 }
 
-func writeAll(writer io.Writer, payload []byte) error {
+func writeAll(ctx context.Context, transport Transport, payload []byte) (int, error) {
+	accepted := 0
 	for len(payload) > 0 {
-		count, err := writer.Write(payload)
-		if err != nil {
-			return err
+		if err := ctx.Err(); err != nil {
+			return accepted, err
 		}
-		if count <= 0 {
-			return io.ErrShortWrite
+		count, err := transport.Write(payload)
+		if count < 0 || count > len(payload) {
+			return accepted, io.ErrShortWrite
 		}
-		if count > len(payload) {
-			return io.ErrShortWrite
-		}
+		accepted += count
 		payload = payload[count:]
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			return accepted, err
+		}
+		if count == 0 {
+			return accepted, io.ErrShortWrite
+		}
 	}
-	return nil
-}
-
-func (session *Session) Close() error {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed {
-		return nil
-	}
-	session.closed = true
-	return session.transport.Close()
+	return accepted, ctx.Err()
 }
