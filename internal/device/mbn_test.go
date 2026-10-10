@@ -195,6 +195,42 @@ func TestCardMBNOverridePropagatesInvalidProfile(t *testing.T) {
 	}
 }
 
+func TestMBNRestartRetainsUnsynchronizedOwner(t *testing.T) {
+	const iccid = "8900000000000000001"
+	client := &transcriptClient{steps: []clientStep{
+		{command: "ATI", response: okResponse("Quectel", "EC20", "Revision: test")},
+		{command: "AT+CPIN?", response: okResponse("+CPIN: READY")},
+		{command: "AT+CCID", response: okResponse("+CCID: " + iccid)},
+		{command: "AT+CIMI", response: okResponse("234150000000001")},
+		{command: "AT+CRSM=176,28486,0,0,17", response: okResponse()},
+		{command: "AT+CSQ", response: okResponse()},
+		{command: `AT+QENG="servingcell"`, response: okResponse()},
+		{command: "AT+COPS?", response: okResponse()},
+		{command: "AT+CEREG?", response: okResponse("+CEREG: 0,1")},
+		{command: "AT+CGSN", response: okResponse("867123456789012")},
+		{command: "AT+CFUN?", response: okResponse("+CFUN: 1")},
+		{command: "AT+CNUM", response: okResponse(`+CNUM: "","+447700900001",145`)},
+		{command: "AT+CFUN?", response: okResponse("+CFUN: 1")},
+		{command: `AT+QMBNCFG="List"`, response: okResponse(ceProfiles(true)...)},
+		{command: `AT+QMBNCFG="AutoSel"`, response: okResponse(`+QMBNCFG: "AutoSel",1`)},
+		{command: `AT+QMBNCFG="AutoSel",0`, response: okResponse()},
+		{command: `AT+QMBNCFG="Select","OpenMkt-Commercial-CU"`, response: okResponse()},
+		{command: "AT+CFUN=1,1", err: modem.ErrSessionUnsynchronized},
+	}}
+	manager, id := newStartedTestManager(t, client)
+	manager.mbnProfileForICCID = func(context.Context, string) (string, error) { return "CU", nil }
+	state, _ := manager.lookup(id)
+	manager.setResult(id, state, &Snapshot{ICCID: iccid, IdentityFilesRead: true, Responsive: true}, nil)
+	if err := manager.ReconcileEC20MBNAfterProfileSwitch(context.Background(), id, iccid); !errors.Is(err, modem.ErrSessionUnsynchronized) || client.closeCount != 0 || state.client != client {
+		t.Fatalf("MBN restart = %v; close count = %d, owner retained = %t", err, client.closeCount, state.client == client)
+	}
+	if !state.opMu.TryLock() {
+		t.Fatal("MBN restart retained the operation lock")
+	}
+	state.opMu.Unlock()
+	client.assertDone(t)
+}
+
 func TestCardMBNOverrideEmptyWhenUnset(t *testing.T) {
 	got, err := (*Manager)(nil).cardMBNOverride(context.Background(), "8985200014631193805")
 	if err != nil || got != "" {
