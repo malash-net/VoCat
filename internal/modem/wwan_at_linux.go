@@ -102,6 +102,32 @@ func (transport *nativeWWANATTransport) Drain() error {
 	return nil
 }
 
+// ResetInputBuffer is only used before starting the session reader.
+func (transport *nativeWWANATTransport) ResetInputBuffer() error {
+	transport.mu.RLock()
+	defer transport.mu.RUnlock()
+	if transport.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	buffer := make([]byte, 4096)
+	for {
+		fds := []unix.PollFd{{Fd: int32(transport.fd), Events: unix.POLLIN}}
+		ready, err := unix.Poll(fds, 0)
+		if err != nil {
+			return err
+		}
+		if ready == 0 || fds[0].Revents&unix.POLLIN == 0 {
+			return nil
+		}
+		if _, err := unix.Read(transport.fd, buffer); err != nil {
+			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
+				continue
+			}
+			return err
+		}
+	}
+}
+
 func (transport *nativeWWANATTransport) SetReadTimeout(timeout time.Duration) error {
 	if timeout < -1 {
 		return fmt.Errorf("invalid read timeout %s", timeout)

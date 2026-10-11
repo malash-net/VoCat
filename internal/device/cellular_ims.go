@@ -188,7 +188,6 @@ func (manager *Manager) SetCellularIMS(ctx context.Context, id string, mode Cell
 	cancel()
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	err = clientCommandError(client, err)
 	if errors.Is(err, modem.ErrSessionUnsynchronized) {
 		manager.setResult(id, state, nil, err)
 		return status, err

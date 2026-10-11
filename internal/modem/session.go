@@ -15,6 +15,7 @@ import (
 type Transport interface {
 	io.ReadWriteCloser
 	Drain() error
+	ResetInputBuffer() error
 	SetReadTimeout(time.Duration) error
 }
 
@@ -94,7 +95,7 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 func (session *Session) Poisoned() bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.stopped() && !errors.Is(session.failure, ErrSessionUnsynchronized)
+	return session.stopped()
 }
 
 func (session *Session) Execute(ctx context.Context, command string) (Response, error) {
@@ -144,7 +145,7 @@ func (session *Session) submit(ctx context.Context, command string, payload []by
 		result := request.resultSnapshot(nil)
 		return result.response, result.err
 	case <-ctx.Done():
-		result := request.canceledResult(commandContextError(ctx.Err()))
+		result := request.resultSnapshot(commandContextError(ctx.Err()))
 		return result.response, result.err
 	case <-session.stop:
 		result := request.resultSnapshot(session.Err())
@@ -211,18 +212,17 @@ func (session *Session) readLoop() {
 	}
 }
 
-func (session *Session) enqueueURC(lines []string) {
+func (session *Session) enqueueURC(line string) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed {
 		return
 	}
-	text := strings.Join(lines, "\n")
 	if len(session.urcs) >= session.options.MaxURCs {
 		copy(session.urcs, session.urcs[1:])
-		session.urcs[len(session.urcs)-1] = text
+		session.urcs[len(session.urcs)-1] = line
 	} else {
-		session.urcs = append(session.urcs, text)
+		session.urcs = append(session.urcs, line)
 	}
 	close(session.urcChanged)
 	session.urcChanged = make(chan struct{})
@@ -279,9 +279,6 @@ func (session *Session) Err() error {
 
 func (session *Session) unavailableErrorLocked() error {
 	if session.failure != nil {
-		if errors.Is(session.failure, ErrSessionUnsynchronized) && !session.closed {
-			return session.failure
-		}
 		return errors.Join(ErrSessionClosed, session.failure)
 	}
 	if session.closed {
@@ -306,18 +303,6 @@ func (session *Session) beginRequest(request *atRequest) error {
 	}
 	request.started = time.Now()
 	return nil
-}
-
-func (session *Session) failProtocol(reason string, cause error) {
-	session.mu.Lock()
-	if !session.closed && !errors.Is(session.failure, ErrSessionUnsynchronized) {
-		session.failure = errors.Join(fmt.Errorf("%w: %s", ErrSessionUnsynchronized, reason), cause)
-	}
-	failure := session.failure
-	session.mu.Unlock()
-	if failure != nil {
-		session.terminate(failure, false)
-	}
 }
 
 func (session *Session) stopped() bool {
@@ -456,27 +441,25 @@ func isURC(line string) bool {
 	return false
 }
 
-func writeAll(ctx context.Context, transport Transport, payload []byte) (int, error) {
-	accepted := 0
+func writeAll(ctx context.Context, transport Transport, payload []byte) error {
 	for len(payload) > 0 {
 		if err := ctx.Err(); err != nil {
-			return accepted, err
+			return err
 		}
 		count, err := transport.Write(payload)
 		if count < 0 || count > len(payload) {
-			return accepted, io.ErrShortWrite
+			return io.ErrShortWrite
 		}
-		accepted += count
 		payload = payload[count:]
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
 		if err != nil {
-			return accepted, err
+			return err
 		}
 		if count == 0 {
-			return accepted, io.ErrShortWrite
+			return io.ErrShortWrite
 		}
 	}
-	return accepted, ctx.Err()
+	return ctx.Err()
 }

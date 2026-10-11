@@ -855,15 +855,6 @@ func (manager *Manager) ExecuteSensitiveAT(
 	return response, err
 }
 
-func clientCommandError(client modem.Client, err error) error {
-	if source, ok := client.(interface{ Err() error }); ok {
-		if failure := source.Err(); errors.Is(failure, modem.ErrSessionUnsynchronized) {
-			return errors.Join(err, failure)
-		}
-	}
-	return err
-}
-
 func (manager *Manager) Reboot(ctx context.Context, id string) error {
 	state, err := manager.lookup(id)
 	if err != nil {
@@ -891,7 +882,6 @@ func (manager *Manager) Reboot(ctx context.Context, id string) error {
 	_, err = client.Execute(commandCtx, "AT+CFUN=1,1")
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	err = clientCommandError(client, err)
 	if errors.Is(err, modem.ErrSessionUnsynchronized) {
 		manager.setResult(id, state, nil, err)
 		return err

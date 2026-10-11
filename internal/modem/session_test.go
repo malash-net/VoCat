@@ -25,19 +25,17 @@ type sessionTestResult struct {
 }
 
 type transcriptTransport struct {
-	mu           sync.Mutex
-	steps        []transportStep
-	reads        []atReadBatch
-	readReady    chan struct{}
-	closed       bool
-	unexpected   error
-	writeEvents  chan string
-	drainErrors  []error
-	drainCount   int
-	drainGate    chan struct{}
-	drainStarted chan struct{}
-	ops          []string
-	accepted     string
+	mu          sync.Mutex
+	steps       []transportStep
+	reads       []atReadBatch
+	readReady   chan struct{}
+	closed      bool
+	unexpected  error
+	writeEvents chan string
+	drainErrors []error
+	drainCount  int
+	ops         []string
+	accepted    string
 }
 
 func (transport *transcriptTransport) Write(payload []byte) (int, error) {
@@ -133,17 +131,12 @@ func (transport *transcriptTransport) Drain() error {
 		err = transport.drainErrors[0]
 		transport.drainErrors = transport.drainErrors[1:]
 	}
-	if transport.drainStarted != nil {
-		close(transport.drainStarted)
-		transport.drainStarted = nil
-	}
-	gate := transport.drainGate
-	transport.drainGate = nil
 	transport.mu.Unlock()
-	if gate != nil {
-		<-gate
-	}
 	return err
+}
+
+func (transport *transcriptTransport) ResetInputBuffer() error {
+	return errors.New("a running session must not discard input")
 }
 
 func (transport *transcriptTransport) SetReadTimeout(time.Duration) error {
@@ -278,25 +271,6 @@ func TestSessionReturnsTypedCommandError(t *testing.T) {
 	}
 }
 
-func TestSessionTimeoutRetainsInputAndRejectsCommandInjection(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		transport := &transcriptTransport{steps: []transportStep{{write: "AT\r"}}}
-		session := newTestSession(t, transport)
-		if _, err := session.Execute(context.Background(), "AT\rAT+CFUN=0"); err == nil {
-			t.Fatal("expected command delimiter rejection")
-		}
-		if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrCommandTimeout) {
-			t.Fatalf("Execute() error = %v", err)
-		}
-		if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) {
-			t.Fatalf("Execute() after timeout = %v", err)
-		}
-		if session.Poisoned() {
-			t.Fatal("timeout poisoned a readable transport")
-		}
-	})
-}
-
 func TestSessionHandlesPartialWrites(t *testing.T) {
 	transport := &transcriptTransport{steps: []transportStep{
 		{write: "AT+CSQ\r", result: func() (int, error) { return 2, nil }},
@@ -374,29 +348,6 @@ func TestSessionExecutePromptRecognizesErrorWithoutEcho(t *testing.T) {
 	})
 }
 
-func TestSessionExecutePromptTimeoutDoesNotWritePayload(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		transport := &transcriptTransport{
-			steps: []transportStep{{write: "AT+CMGS=5\r"}},
-		}
-		session := newTestSession(t, transport)
-		_, err := session.ExecutePrompt(
-			context.Background(),
-			"AT+CMGS=5",
-			[]byte("001122"),
-		)
-		if !errors.Is(err, ErrCommandTimeout) {
-			t.Fatalf("error = %v", err)
-		}
-		if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) {
-			t.Fatalf("Execute() after prompt timeout = %v", err)
-		}
-		if session.Poisoned() {
-			t.Fatal("prompt timeout poisoned the transport")
-		}
-	})
-}
-
 func TestSessionExecutePromptSerializesConcurrentCommand(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		events := make(chan string, 4)
@@ -436,6 +387,9 @@ func TestSessionExecutePromptSerializesConcurrentCommand(t *testing.T) {
 func TestSessionExecutePromptRejectsUnsafeInput(t *testing.T) {
 	transport := &transcriptTransport{}
 	session := newTestSession(t, transport)
+	if _, err := session.Execute(context.Background(), "AT\rAT+CFUN=0"); err == nil {
+		t.Fatal("expected command delimiter rejection")
+	}
 	if _, err := session.ExecutePrompt(
 		context.Background(),
 		"AT+CSQ",
@@ -565,43 +519,61 @@ func TestSessionDoesNotAssignOldBatchTailToQueuedCommand(t *testing.T) {
 	})
 }
 
-func TestSessionCanceledPromptKeepsWireOwnership(t *testing.T) {
-	for _, submitted := range []bool{false, true} {
-		t.Run(fmt.Sprintf("submitted_%t", submitted), func(t *testing.T) {
+func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		prompt, submitted bool
+		timeout           bool
+	}{
+		{name: "query canceled"},
+		{name: "query timeout", timeout: true},
+		{name: "late prompt canceled", prompt: true},
+		{name: "late prompt timeout", prompt: true, timeout: true},
+		{name: "submitted SMS canceled", prompt: true, submitted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				events := make(chan string, 4)
-				steps := []transportStep{{write: "AT+CMGS=5\r"}}
-				if submitted {
+				command := "AT+CSQ"
+				if test.prompt {
+					command = "AT+CMGS=5"
+				}
+				steps := []transportStep{{write: command + "\r"}}
+				if test.submitted {
 					steps[0].chunks = []string{"\r\n> "}
 					steps = append(steps, transportStep{write: "001122"}, transportStep{write: "\x1a"})
-				} else {
+				} else if test.prompt {
 					steps = append(steps, transportStep{write: "\x1b"})
 				}
-				steps = append(steps, transportStep{write: "AT\r", chunks: []string{"\r\nOK\r\n"}})
+				steps = append(steps, transportStep{write: "AT+CPIN?\r", chunks: []string{"\r\n+CPIN: READY\r\nOK\r\n"}})
+				events := make(chan string, 4)
 				transport := &transcriptTransport{steps: steps, writeEvents: events}
 				session := newTestSession(t, transport)
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				result := runPrompt(ctx, session, "AT+CMGS=5", []byte("001122"))
+				var result <-chan sessionTestResult
+				if test.prompt {
+					result = runPrompt(ctx, session, command, []byte("001122"))
+				} else {
+					result = runExecute(ctx, session, command)
+				}
 				<-events
-				if submitted {
+				if test.submitted {
 					<-events
 					<-events
 				}
-				cancel()
-				synctest.Wait()
-				select {
-				case got := <-result:
-					if !errors.Is(got.err, context.Canceled) || got.response.Final != "" {
-						t.Fatalf("ExecutePrompt() = %#v, %v", got.response, got.err)
-					}
-				default:
-					t.Fatal("canceled CMGS waited for the prompt or final")
+				wantErr := context.Canceled
+				if test.timeout {
+					wantErr = ErrCommandTimeout
+				} else {
+					cancel()
 				}
-				if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) {
-					t.Fatalf("AT before prompt completion = %v", err)
+				if got := <-result; !errors.Is(got.err, wantErr) || !errors.Is(got.err, ErrSessionUnsynchronized) || got.response.Final != "" {
+					t.Fatalf("expired transaction = %#v, %v", got.response, got.err)
 				}
-				if !submitted {
+				if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) || session.Poisoned() {
+					t.Fatalf("AT before late final = %v, poisoned = %t", err, session.Poisoned())
+				}
+				if test.prompt && !test.submitted {
 					transport.enqueue("\r\n> ")
 					if write := <-events; write != "\x1b" {
 						t.Fatalf("late prompt write = %q, want ESC", write)
@@ -610,10 +582,10 @@ func TestSessionCanceledPromptKeepsWireOwnership(t *testing.T) {
 						t.Fatalf("AT before abort acknowledgement = %v", err)
 					}
 				}
-				transport.enqueue("\r\nOK\r\n")
+				transport.enqueue("\r\nlate reply\r\nOK\r\n")
 				synctest.Wait()
-				if response, err := session.Execute(context.Background(), "AT"); err != nil || !response.OK() {
-					t.Fatalf("AT after prompt completion = %#v, %v", response, err)
+				if response, err := session.Execute(context.Background(), "AT+CPIN?"); err != nil || !response.OK() || response.Text() != "+CPIN: READY" {
+					t.Fatalf("query after late final = %#v, %v", response, err)
 				}
 			})
 		})
@@ -667,30 +639,6 @@ func TestSessionCallCommandResults(t *testing.T) {
 	}
 }
 
-func TestSessionUnsupportedInputStopsBatch(t *testing.T) {
-	for _, test := range []struct {
-		command string
-		input   string
-		cause   error
-	}{
-		{command: "AT+CSQ", input: "> \r\nOK\r\n", cause: ErrSessionUnsynchronized},
-		{command: "ATD12345", input: "CONNECT 115200\r\nOK\r\n", cause: ErrUnsupportedDataMode},
-	} {
-		t.Run(test.command, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				transport := &transcriptTransport{steps: []transportStep{{write: test.command + "\r", chunks: []string{test.input}}}}
-				session := newTestSession(t, transport)
-				response, err := session.Execute(context.Background(), test.command)
-				if !errors.Is(err, test.cause) || response.Final != "" {
-					t.Fatalf("Execute() = %#v, %v", response, err)
-				}
-				synctest.Wait()
-				assertSessionUnsynchronized(t, session, transport)
-			})
-		})
-	}
-}
-
 func TestSessionDrainsBeforeWritingCommand(t *testing.T) {
 	transport := &transcriptTransport{steps: []transportStep{{
 		write:  "AT+CSQ\r",
@@ -705,59 +653,6 @@ func TestSessionDrainsBeforeWritingCommand(t *testing.T) {
 	transport.mu.Unlock()
 	if len(ops) != 2 || ops[0] != "drain" || ops[1] != "write:AT+CSQ\r" {
 		t.Fatalf("transport operations = %q, want drain before the command write", ops)
-	}
-}
-
-func TestSessionConsumesRXPublishedDuringPreWriteDrain(t *testing.T) {
-	for _, cancelPending := range []bool{false, true} {
-		t.Run(fmt.Sprintf("cancel_%t", cancelPending), func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				gate, started := make(chan struct{}), make(chan struct{})
-				releaseDrain := sync.OnceFunc(func() { close(gate) })
-				events := make(chan string, 2)
-				steps := []transportStep{{write: "AT\r", chunks: []string{"\r\nOK\r\n"}}}
-				if !cancelPending {
-					steps = append([]transportStep{{write: "AT+CPIN?\r", chunks: []string{"\r\n+CPIN: READY\r\nOK\r\n"}}}, steps...)
-				}
-				transport := &transcriptTransport{
-					steps:        steps,
-					writeEvents:  events,
-					drainGate:    gate,
-					drainStarted: started,
-				}
-				session := newTestSession(t, transport)
-				t.Cleanup(releaseDrain)
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				result := runExecute(ctx, session, "AT+CPIN?")
-				<-started
-				next := runExecute(context.Background(), session, "AT")
-				transport.enqueue("\r\n+CFUN: STA")
-				synctest.Wait()
-				releaseDrain()
-				synctest.Wait()
-				select {
-				case write := <-events:
-					t.Fatalf("wrote before pre-drain frame completed: %q", write)
-				default:
-				}
-				if cancelPending {
-					cancel()
-					if got := <-result; !errors.Is(got.err, context.Canceled) {
-						t.Fatalf("pending cancellation = %v", got.err)
-					}
-				}
-				transport.enqueue("LE\r\nOK\r\n")
-				if !cancelPending {
-					if got := <-result; got.err != nil || !got.response.OK() || got.response.Text() != "+CPIN: READY" {
-						t.Fatalf("CPIN = %#v, %v", got.response, got.err)
-					}
-				}
-				if got := <-next; got.err != nil || !got.response.OK() {
-					t.Fatalf("command behind pending = %#v, %v", got.response, got.err)
-				}
-			})
-		})
 	}
 }
 
@@ -854,11 +749,13 @@ func TestSessionPayloadWriteFailureDoesNotSendTerminator(t *testing.T) {
 		session := newTestSession(t, transport)
 		response, err := session.ExecutePrompt(context.Background(), "AT+CMGS=5", []byte("HELLO"))
 		var commandErr *CommandError
-		if !errors.Is(err, ErrSessionUnsynchronized) || !errors.Is(err, syscall.EIO) || errors.As(err, &commandErr) || response.Final != "" {
+		if !errors.Is(err, ErrSessionClosed) || !errors.Is(err, syscall.EIO) || errors.As(err, &commandErr) || response.Final != "" {
 			t.Fatalf("payload write failure = %#v, %v", response, err)
 		}
 		synctest.Wait()
-		assertSessionUnsynchronized(t, session, transport)
+		if !session.Poisoned() {
+			t.Fatal("transport write failure must allow the manager to reopen the port")
+		}
 		transport.assertAccepted(t, "AT+CMGS=5\rHE")
 		transport.mu.Lock()
 		defer transport.mu.Unlock()
@@ -867,44 +764,6 @@ func TestSessionPayloadWriteFailureDoesNotSendTerminator(t *testing.T) {
 				t.Fatalf("terminator after payload failure: %q", op)
 			}
 		}
-	})
-}
-
-func TestSessionPendingWriteFailureOverridesReadFailure(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const command = "AT+CSQ\r"
-		started, release := make(chan struct{}), make(chan struct{})
-		releaseWrite := sync.OnceFunc(func() { close(release) })
-		transport := &transcriptTransport{steps: []transportStep{{write: command, result: func() (int, error) {
-			close(started)
-			<-release
-			return 2, io.ErrShortWrite
-		}}}}
-		session := newTestSession(t, transport)
-		t.Cleanup(releaseWrite)
-		result := runExecute(context.Background(), session, strings.TrimSuffix(command, "\r"))
-		<-started
-		transport.enqueueRead(atReadBatch{err: syscall.EIO})
-		synctest.Wait()
-		if !errors.Is(session.Err(), syscall.EIO) {
-			t.Fatal("reader did not observe injected EIO")
-		}
-		if session.Poisoned() {
-			t.Fatal("reader failure allowed reopening while committed write was pending")
-		}
-		select {
-		case got := <-result:
-			t.Fatalf("pending write completed before accepted count was known: %#v, %v", got.response, got.err)
-		default:
-		}
-		releaseWrite()
-		got := <-result
-		if !errors.Is(got.err, ErrSessionUnsynchronized) || !errors.Is(got.err, io.ErrShortWrite) || errors.Is(got.err, syscall.EIO) || got.response.Final != "" {
-			t.Fatalf("partial write after reader failure = %#v, %v", got.response, got.err)
-		}
-		synctest.Wait()
-		assertSessionUnsynchronized(t, session, transport)
-		transport.assertAccepted(t, command[:2])
 	})
 }
 
@@ -935,6 +794,7 @@ func TestSessionFinalPrecedesReadEOF(t *testing.T) {
 		if got := <-next; !errors.Is(got.err, io.EOF) || !errors.Is(got.err, ErrSessionClosed) || got.response.Final != "" {
 			t.Fatalf("queued command after EOF = %#v, %v", got.response, got.err)
 		}
+		synctest.Wait()
 		if !session.Poisoned() {
 			t.Fatal("physical EOF did not poison the session")
 		}
@@ -942,22 +802,6 @@ func TestSessionFinalPrecedesReadEOF(t *testing.T) {
 			t.Fatalf("new command after EOF = %v", err)
 		}
 	})
-}
-
-func assertSessionUnsynchronized(t *testing.T, session *Session, transport *transcriptTransport) {
-	t.Helper()
-	if session.Poisoned() {
-		t.Fatal("logical failure poisoned the session")
-	}
-	if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) || errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("Execute after logical failure = %v", err)
-	}
-	transport.mu.Lock()
-	closed := transport.closed
-	transport.mu.Unlock()
-	if !closed {
-		t.Fatal("logical failure did not close the transport")
-	}
 }
 
 func runExecute(ctx context.Context, session *Session, command string) <-chan sessionTestResult {

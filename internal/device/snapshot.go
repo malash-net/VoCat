@@ -47,8 +47,10 @@ func (manager *Manager) readSnapshot(
 	} else if snapshot.Model == "" && !strings.EqualFold(candidate.Product, "Android") {
 		snapshot.Model = candidate.Product
 	}
-	nativeWWAN := candidate.HardwareKind == "wwan" || isNativeQMICandidate(candidate)
-	if isNativeQMICandidate(candidate) {
+	// Native QMI modems can return an IMEI from CGSN without a final OK.
+	// Use DMS instead: an unfinished AT query would retain session ownership.
+	nativeQMI := isNativeQMICandidate(candidate)
+	if nativeQMI {
 		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
 		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
 		cancelQMI()
@@ -250,7 +252,7 @@ func (manager *Manager) readSnapshot(
 		snapshot.RegistrationStatus = 1
 		snapshot.RegistrationSource = "COPS"
 	}
-	if snapshot.IMEI == "" && !nativeWWAN {
+	if snapshot.IMEI == "" && !nativeQMI {
 		for _, command := range []string{"AT+CGSN", "AT+CGSN=1"} {
 			cgsnCtx, cancelCGSN := context.WithTimeout(ctx, manager.commandTimeout)
 			cgsnResponse, cgsnErr := manager.command(cgsnCtx, client, command)

@@ -235,6 +235,17 @@ func (transport *linuxSerialTransport) Drain() error {
 	}
 }
 
+// ResetInputBuffer is only used before starting the session reader.
+func (transport *linuxSerialTransport) ResetInputBuffer() error {
+	transport.mu.RLock()
+	defer transport.mu.RUnlock()
+	fd, err := transport.currentFD()
+	if err != nil {
+		return err
+	}
+	return unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+}
+
 func (transport *linuxSerialTransport) SetReadTimeout(timeout time.Duration) error {
 	if timeout < 0 {
 		return fmt.Errorf("invalid serial read timeout %s", timeout)

@@ -12,7 +12,6 @@ var (
 	ErrUnsupportedPlatform   = errors.New("modem: platform is not supported")
 	ErrSessionClosed         = errors.New("modem: AT session is closed")
 	ErrSessionUnsynchronized = errors.New("modem: previous AT transaction has not completed")
-	ErrUnsupportedDataMode   = errors.New("modem: transparent data mode is not supported")
 	ErrCommandTimeout        = errors.New("modem: AT command timed out")
 	ErrPromptNotReceived     = errors.New("modem: command completed without a prompt")
 )

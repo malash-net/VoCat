@@ -431,7 +431,6 @@ func (manager *Manager) ReconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 	cancelReboot()
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	rebootErr = clientCommandError(client, rebootErr)
 	if errors.Is(rebootErr, modem.ErrSessionUnsynchronized) {
 		manager.setResult(id, state, nil, rebootErr)
 		state.opMu.Unlock()

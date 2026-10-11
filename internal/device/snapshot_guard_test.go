@@ -64,10 +64,11 @@ func TestNativeSnapshotSkipsCGSNAndPreservesIMEICache(t *testing.T) {
 		candidate modem.Candidate
 		dmsErr    error
 		wantIMEI  string
+		wantCGSN  bool
 	}{
 		{name: "DMS success with AT backend", candidate: modem.Candidate{ID: "mhi-wwan0", QMIControl: "/dev/wwan0qmi0"}, wantIMEI: "861716070416510"},
 		{name: "DMS failure keeps cache", candidate: modem.Candidate{ID: "mhi-wwan0", QMIControl: "/dev/wwan0qmi0"}, dmsErr: errors.New("DMS failed"), wantIMEI: cachedIMEI},
-		{name: "native without QMI keeps cache", candidate: modem.Candidate{HardwareKind: "wwan"}, wantIMEI: cachedIMEI},
+		{name: "WWAN without QMI uses AT", candidate: modem.Candidate{HardwareKind: "wwan"}, wantIMEI: "866241014372802", wantCGSN: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &lenientATClient{cgsnIMEI: "866241014372802"}
@@ -79,8 +80,8 @@ func TestNativeSnapshotSkipsCGSNAndPreservesIMEICache(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if client.saw("AT+CGSN") || client.saw("AT+CGSN=1") {
-				t.Fatalf("native AT IMEI probe issued: %v", client.commands)
+			if client.saw("AT+CGSN") != test.wantCGSN || client.saw("AT+CGSN=1") {
+				t.Fatalf("AT IMEI probes = %v, want CGSN = %t", client.commands, test.wantCGSN)
 			}
 			if snapshot.IMEI != test.wantIMEI {
 				t.Fatalf("IMEI = %q, want %q", snapshot.IMEI, test.wantIMEI)
