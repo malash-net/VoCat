@@ -50,7 +50,7 @@ func (manager *Manager) readSnapshot(
 	// Native MHI/QMI devices expose their immutable modem identity through DMS.
 	// Read it before any SIM-dependent AT probes: a missing/bad card can make
 	// those commands slow or fail, but must never prevent IMEI from appearing.
-	if strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
+	if isNativeQMICandidate(candidate) {
 		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
 		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
 		cancelQMI()
@@ -265,16 +265,6 @@ func (manager *Manager) readSnapshot(
 					break
 				}
 			}
-		}
-	}
-	if snapshot.IMEI == "" && strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
-		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
-		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
-		cancelQMI()
-		if qmiErr == nil {
-			snapshot.IMEI = qmiIMEI
-		} else {
-			snapshot.Warnings = append(snapshot.Warnings, "read IMEI via QMI DMS: "+qmiErr.Error())
 		}
 	}
 	if snapshot.IMEI == "" && previousSnapshot != nil {

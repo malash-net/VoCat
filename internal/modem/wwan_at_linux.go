@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -20,7 +19,7 @@ type nativeWWANATTransport struct {
 	mu          sync.RWMutex
 	fd          int
 	readTimeout time.Duration
-	closed      atomic.Bool
+	closed      bool
 }
 
 func openNativeWWANATTransport(path string) (Transport, error) {
@@ -34,7 +33,7 @@ func openNativeWWANATTransport(path string) (Transport, error) {
 func (transport *nativeWWANATTransport) Read(buffer []byte) (int, error) {
 	transport.mu.RLock()
 	defer transport.mu.RUnlock()
-	if transport.closed.Load() {
+	if transport.closed {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -43,22 +42,16 @@ func (transport *nativeWWANATTransport) Read(buffer []byte) (int, error) {
 		deadline = time.Now().Add(transport.readTimeout)
 	}
 	for {
-		if transport.closed.Load() {
-			return 0, io.ErrClosedPipe
-		}
-		timeout := 100
+		timeout := -1
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				return 0, nil
 			}
-			timeout = int((min(remaining, 100*time.Millisecond) + time.Millisecond - 1) / time.Millisecond)
+			timeout = int((remaining + time.Millisecond - 1) / time.Millisecond)
 		}
 		fds := []unix.PollFd{{Fd: int32(transport.fd), Events: unix.POLLIN}}
 		ready, err := unix.Poll(fds, timeout)
-		if transport.closed.Load() {
-			return 0, io.ErrClosedPipe
-		}
 		if errors.Is(err, unix.EINTR) {
 			continue
 		}
@@ -66,7 +59,7 @@ func (transport *nativeWWANATTransport) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 		if ready == 0 {
-			continue
+			return 0, nil
 		}
 		if fds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 &&
 			fds[0].Revents&unix.POLLIN == 0 {
@@ -79,34 +72,50 @@ func (transport *nativeWWANATTransport) Read(buffer []byte) (int, error) {
 		if count < 0 {
 			count = 0
 		}
-		if len(buffer) > 0 && count == 0 && err == nil && fds[0].Revents&(unix.POLLHUP|unix.POLLERR) != 0 {
-			return 0, io.EOF
-		}
 		return count, err
 	}
 }
 
 func (transport *nativeWWANATTransport) Write(buffer []byte) (int, error) {
-	if transport.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
 	transport.mu.RLock()
 	defer transport.mu.RUnlock()
-	return nativeWrite(transport.fd, buffer, &transport.closed, io.ErrClosedPipe)
+	if transport.closed {
+		return 0, io.ErrClosedPipe
+	}
+	for {
+		count, err := unix.Write(transport.fd, buffer)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if errors.Is(err, unix.EAGAIN) {
+			fds := []unix.PollFd{{Fd: int32(transport.fd), Events: unix.POLLOUT}}
+			if _, pollErr := unix.Poll(fds, 1000); pollErr != nil {
+				return 0, pollErr
+			}
+			continue
+		}
+		if count < 0 {
+			count = 0
+		}
+		return count, err
+	}
 }
 
 func (transport *nativeWWANATTransport) Drain() error {
-	if transport.closed.Load() {
+	transport.mu.RLock()
+	defer transport.mu.RUnlock()
+	if transport.closed {
 		return io.ErrClosedPipe
 	}
+	// WWAN writes have no termios output queue. Input belongs to Session;
+	// discarding it here could lose a pending final or an unsolicited event.
 	return nil
 }
 
-// ResetInputBuffer is only used before starting the session reader.
 func (transport *nativeWWANATTransport) ResetInputBuffer() error {
 	transport.mu.RLock()
 	defer transport.mu.RUnlock()
-	if transport.closed.Load() {
+	if transport.closed {
 		return io.ErrClosedPipe
 	}
 	buffer := make([]byte, 4096)
@@ -134,7 +143,7 @@ func (transport *nativeWWANATTransport) SetReadTimeout(timeout time.Duration) er
 	}
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	if transport.closed.Load() {
+	if transport.closed {
 		return io.ErrClosedPipe
 	}
 	transport.readTimeout = timeout
@@ -142,13 +151,11 @@ func (transport *nativeWWANATTransport) SetReadTimeout(timeout time.Duration) er
 }
 
 func (transport *nativeWWANATTransport) Close() error {
-	transport.closed.Store(true)
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	if transport.fd < 0 {
+	if transport.closed {
 		return nil
 	}
-	err := unix.Close(transport.fd)
-	transport.fd = -1
-	return err
+	transport.closed = true
+	return unix.Close(transport.fd)
 }

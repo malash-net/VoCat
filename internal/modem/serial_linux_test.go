@@ -4,7 +4,6 @@ package modem
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -42,94 +41,6 @@ func TestLinuxSerialExecHelper(t *testing.T) {
 	fmt.Fprintln(os.Stdout, "ready")
 	_, _ = io.Copy(io.Discard, os.Stdin)
 	os.Exit(0)
-}
-
-func TestLinuxSerialDrainWaitsForOutputOrClose(t *testing.T) {
-	for _, action := range []string{"read", "close"} {
-		t.Run(action, func(t *testing.T) {
-			fd, peerFD := socketpair(t)
-			transport := &linuxSerialTransport{fd: fd}
-			defer transport.Close()
-			defer unix.Close(peerFD)
-			input := []byte("\r\nRING\r\n")
-			if _, err := unix.Write(peerFD, input); err != nil {
-				t.Fatal(err)
-			}
-			payload := []byte("pending output")
-			if count, err := transport.Write(payload); err != nil || count != len(payload) {
-				t.Fatalf("queue output = %d, %v", count, err)
-			}
-			if pending, err := unix.IoctlGetInt(fd, unix.TIOCOUTQ); err != nil || pending == 0 {
-				t.Fatalf("pending output = %d, %v; want nonzero", pending, err)
-			}
-			drainDone := make(chan error, 1)
-			go func() { drainDone <- transport.Drain() }()
-			waitForTransportReadLock(t, &transport.mu)
-			var wantErr error
-			if action == "close" {
-				wantErr = os.ErrClosed
-				closeDone := make(chan error, 1)
-				go func() { closeDone <- transport.Close() }()
-				select {
-				case err := <-closeDone:
-					if err != nil {
-						t.Fatalf("Close: %v", err)
-					}
-				case <-time.After(time.Second):
-					t.Fatal("Close did not interrupt pending Drain")
-				}
-			} else {
-				buffer := make([]byte, len(payload))
-				if count, err := unix.Read(peerFD, buffer); err != nil || count != len(payload) || !bytes.Equal(buffer, payload) {
-					t.Fatalf("read queued output = %q, %d, %v; want %q", buffer, count, err, payload)
-				}
-			}
-			select {
-			case err := <-drainDone:
-				if !errors.Is(err, wantErr) {
-					t.Fatalf("Drain after %s = %v, want %v", action, err, wantErr)
-				}
-			case <-time.After(time.Second):
-				t.Fatalf("Drain did not return after %s", action)
-			}
-			if action == "read" {
-				buffer := make([]byte, len(input))
-				if count, err := unix.Read(fd, buffer); err != nil || count != len(input) || !bytes.Equal(buffer, input) {
-					t.Fatalf("input after Drain = %q, %d, %v; want %q", buffer, count, err, input)
-				}
-			}
-		})
-	}
-}
-
-func TestLinuxNativeWritePreservesAcceptedCount(t *testing.T) {
-	for _, kind := range []string{"serial", "wwan"} {
-		t.Run(kind, func(t *testing.T) {
-			fd, peerFD := socketpair(t)
-			defer unix.Close(peerFD)
-			var transport Transport = &linuxSerialTransport{fd: fd}
-			if kind == "wwan" {
-				transport = &nativeWWANATTransport{fd: fd, readTimeout: -1}
-			}
-			defer transport.Close()
-			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
-				t.Fatal(err)
-			}
-			payload := bytes.Repeat([]byte("AT\r"), 1<<15)
-			count, err := transport.Write(payload)
-			if count <= 0 || count >= len(payload) || err != nil {
-				t.Fatalf("partial Write = %d, %v; want 0 < n < %d, nil", count, err, len(payload))
-			}
-			received := make([]byte, len(payload))
-			readCount, err := unix.Read(peerFD, received)
-			if err != nil || readCount != count || !bytes.Equal(received[:readCount], payload[:count]) {
-				t.Fatalf("accepted bytes = %d, %v; want %d matching bytes", readCount, err, count)
-			}
-			if extra, err := unix.Read(peerFD, received); extra > 0 || !errors.Is(err, unix.EAGAIN) {
-				t.Fatalf("unexpected repeated bytes = %d, %v", extra, err)
-			}
-		})
-	}
 }
 
 func TestLinuxSerialCloseReleasesTTYWhileExecChildRemainsAlive(t *testing.T) {

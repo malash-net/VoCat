@@ -58,18 +58,41 @@ func (c *lenientATClient) saw(command string) bool {
 }
 
 func TestSnapshotSkipsCGSNOnlyForNativeQMI(t *testing.T) {
-	for _, id := range []string{"mhi-wwan0", "usb-ec20"} {
-		t.Run(id, func(t *testing.T) {
-			candidate := modem.Candidate{ID: id, QMIControl: "/dev/wwan0qmi0"}
+	for _, test := range []struct {
+		name, id, backend string
+		qmiErr            error
+	}{
+		{name: "native AT", id: "mhi-wwan0", backend: "at"},
+		{name: "native QMI", id: "mhi-wwan0", backend: "qmi"},
+		{name: "native AT failure", id: "mhi-wwan0", backend: "at", qmiErr: errors.New("DMS unavailable")},
+		{name: "native QMI failure", id: "mhi-wwan0", backend: "qmi", qmiErr: errors.New("DMS unavailable")},
+		{name: "USB AT", id: "usb-ec20", backend: "at"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := modem.Candidate{ID: test.id, QMIControl: "/dev/wwan0qmi0"}
 			client := &lenientATClient{}
-			manager := &Manager{commandTimeout: time.Second}
-			_, err := manager.readSnapshot(context.Background(), id, candidate, "at", "", nil, client)
+			qmiCalls := 0
+			manager := &Manager{commandTimeout: time.Second, qmiRadioOpener: func(context.Context, string) (qmiRadioSession, error) {
+				qmiCalls++
+				return &fakeQMIRadioSession{imei: "866241014372802", imeiErr: test.qmiErr}, nil
+			}}
+			snapshot, err := manager.readSnapshot(context.Background(), test.id, candidate, test.backend, "", nil, client)
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantCGSN := id == "usb-ec20"
+			wantCGSN := test.id == "usb-ec20"
 			if client.saw("AT+CGSN") != wantCGSN || client.saw("AT+CGSN=1") != wantCGSN {
 				t.Fatalf("commands = %v, want CGSN probes = %t", client.commands, wantCGSN)
+			}
+			wantCalls, wantIMEI := 0, ""
+			if !wantCGSN {
+				wantCalls = 1
+				if test.qmiErr == nil {
+					wantIMEI = "866241014372802"
+				}
+			}
+			if qmiCalls != wantCalls || snapshot.IMEI != wantIMEI {
+				t.Fatalf("DMS calls = %d, IMEI = %q; want %d, %q", qmiCalls, snapshot.IMEI, wantCalls, wantIMEI)
 			}
 		})
 	}
@@ -138,10 +161,10 @@ func TestManagerRefreshSkipsQMIICCIDWithoutReadySIM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	// The initial DMS read and its existing fallback both fail; the UIM
-	// ICCID fallback must still be skipped without a READY SIM.
-	if qmiCalls != 2 {
-		t.Fatalf("qmiRadioOpener called %d times, want 2 DMS attempts and no UIM ICCID read", qmiCalls)
+	// Only the SIM-independent DMS read is attempted; the UIM ICCID fallback
+	// must still be skipped without a READY SIM.
+	if qmiCalls != 1 {
+		t.Fatalf("qmiRadioOpener called %d times, want 1 DMS attempt and no UIM ICCID read", qmiCalls)
 	}
 	if client.saw("AT+CGSN") || client.saw("AT+CGSN=1") || snapshot.IMEI != "" {
 		t.Fatalf("native IMEI fell back to AT: %q, commands = %v", snapshot.IMEI, client.commands)
