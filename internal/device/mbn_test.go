@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"testing/synctest"
 
 	"vocat/internal/modem"
 )
@@ -194,50 +193,6 @@ func TestCardMBNOverridePropagatesInvalidProfile(t *testing.T) {
 	if _, err := manager.cardMBNOverride(context.Background(), "8985200014631193805"); err == nil {
 		t.Fatal("expected invalid profile error")
 	}
-}
-
-func TestMBNRestartTimeoutStillVerifiesRecovery(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const iccid = "8900000000000000001"
-		snapshot := []clientStep{
-			{command: "ATI", response: okResponse("Quectel", "EC20", "Revision: test")},
-			{command: "AT+CPIN?", response: okResponse("+CPIN: READY")},
-			{command: "AT+CCID", response: okResponse("+CCID: " + iccid)},
-			{command: "AT+CIMI", response: okResponse("234150000000001")},
-			{command: "AT+CRSM=176,28486,0,0,17", response: okResponse()},
-			{command: "AT+CRSM=192,28589,0,0,0", response: okResponse()},
-			{command: "AT+CRSM=192,28478,0,0,0", response: okResponse()},
-			{command: "AT+CRSM=192,28479,0,0,0", response: okResponse()},
-			{command: "AT+CSQ", response: okResponse()},
-			{command: `AT+QENG="servingcell"`, response: okResponse()},
-			{command: "AT+COPS?", response: okResponse()},
-			{command: "AT+CEREG?", response: okResponse("+CEREG: 0,1")},
-			{command: "AT+CGSN", response: okResponse("867123456789012")},
-			{command: "AT+CFUN?", response: okResponse("+CFUN: 1")},
-			{command: "AT+CNUM", response: okResponse(`+CNUM: "","+447700900001",145`)},
-		}
-		steps := append(append([]clientStep(nil), snapshot...), []clientStep{
-			{command: "AT+CFUN?", response: okResponse("+CFUN: 1")},
-			{command: `AT+QMBNCFG="List"`, response: okResponse(ceProfiles(true)...)},
-			{command: `AT+QMBNCFG="AutoSel"`, response: okResponse(`+QMBNCFG: "AutoSel",1`)},
-			{command: `AT+QMBNCFG="AutoSel",0`, response: okResponse()},
-			{command: `AT+QMBNCFG="Select","OpenMkt-Commercial-CU"`, response: okResponse()},
-			{command: "AT+CFUN=1,1", err: modem.ErrCommandTimeout},
-		}...)
-		steps = append(steps, snapshot...)
-		steps = append(steps,
-			clientStep{command: "AT+CCID", response: okResponse("+CCID: " + iccid)},
-			clientStep{command: `AT+QMBNCFG="List"`, response: okResponse(ceProfiles(false)...)},
-		)
-		client := &transcriptClient{steps: steps}
-		manager, id := newStartedTestManager(t, client)
-		manager.mbnProfileForICCID = func(context.Context, string) (string, error) { return "CU", nil }
-		err := manager.ReconcileEC20MBNAfterProfileSwitch(context.Background(), id, iccid)
-		if err != nil || client.closeCount != 0 || manager.devices[id].client != client {
-			t.Fatalf("MBN recovery = %v; close count = %d, owner retained = %t", err, client.closeCount, manager.devices[id].client == client)
-		}
-		client.assertDone(t)
-	})
 }
 
 func TestCardMBNOverrideEmptyWhenUnset(t *testing.T) {

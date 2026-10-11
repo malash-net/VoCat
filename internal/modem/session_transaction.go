@@ -10,15 +10,13 @@ import (
 
 type atRequest struct {
 	ctx     context.Context
-	command string
 	payload []byte
 	done    chan struct{}
 
-	mu        sync.Mutex
-	response  Response
-	err       error
-	started   time.Time
-	completed bool
+	mu       sync.Mutex
+	response Response
+	err      error
+	started  time.Time
 
 	responsePrefix string
 	awaitPrompt    bool
@@ -26,7 +24,7 @@ type atRequest struct {
 
 func newATRequest(ctx context.Context, command string, payload []byte, interactive bool) *atRequest {
 	return &atRequest{
-		ctx: ctx, command: command, payload: payload, awaitPrompt: interactive,
+		ctx: ctx, payload: payload, awaitPrompt: interactive,
 		done: make(chan struct{}), response: Response{Command: command}, responsePrefix: expectedResponsePrefix(command),
 	}
 }
@@ -53,11 +51,13 @@ func (request *atRequest) resultSnapshot(err error) (Response, error) {
 	response := request.response
 	response.Lines = append([]string(nil), response.Lines...)
 	response.URCs = append([]string(nil), response.URCs...)
-	if !request.completed && !request.started.IsZero() {
-		response.Duration = time.Since(request.started)
-	}
-	if request.completed {
+	select {
+	case <-request.done:
 		err = request.err
+	default:
+		if !request.started.IsZero() {
+			response.Duration = time.Since(request.started)
+		}
 	}
 	return response, err
 }
@@ -69,17 +69,16 @@ func (request *atRequest) complete(final string, err error) {
 	if err == nil {
 		if strings.EqualFold(final, "OK") {
 			if request.awaitPrompt {
-				err = fmt.Errorf("%w: %s", ErrPromptNotReceived, request.command)
+				err = fmt.Errorf("%w: %s", ErrPromptNotReceived, request.response.Command)
 			}
 		} else {
-			err = &CommandError{Command: request.command, Final: final, Lines: append([]string(nil), request.response.Lines...)}
+			err = &CommandError{Command: request.response.Command, Final: final, Lines: append([]string(nil), request.response.Lines...)}
 		}
 	}
 	request.err = err
 	if !request.started.IsZero() {
 		request.response.Duration = time.Since(request.started)
 	}
-	request.completed = true
 	close(request.done)
 }
 
@@ -177,7 +176,7 @@ func (controller *atController) start(request *atRequest) {
 		return
 	}
 	controller.owner = request
-	err := writeAll(controller.session.lifetime, controller.session.transport, []byte(request.command+"\r"))
+	err := writeAll(controller.session.lifetime, controller.session.transport, []byte(request.response.Command+"\r"))
 	if err != nil {
 		controller.failIO("write serial command", err)
 	} else if request.awaitPrompt {
@@ -241,13 +240,13 @@ func (controller *atController) handleLine(line string) {
 		}
 		return
 	}
-	if strings.EqualFold(line, request.command) ||
+	if strings.EqualFold(line, request.response.Command) ||
 		(!request.awaitPrompt && len(request.payload) > 0 && line == string(request.payload)) {
 		return
 	}
 	if isCallResult(line) {
 		controller.emitURC(line)
-		if isCallCommand(request.command) {
+		if isCallCommand(request.response.Command) {
 			controller.finish(line)
 		}
 		return
@@ -274,42 +273,23 @@ func (controller *atController) finish(final string) {
 
 func (controller *atController) handlePrompt() {
 	request := controller.owner
-	if request.ctx.Err() != nil {
-		controller.abortPrompt()
-		return
+	terminator := byte(0x1b) // ESC cancels a prompt whose caller has left.
+	if request.ctx.Err() == nil {
+		if err := writeAll(controller.session.lifetime, controller.session.transport, request.payload); err != nil {
+			controller.failIO("write SMS payload", err)
+			return
+		}
+		if request.ctx.Err() == nil {
+			terminator = 0x1a // Ctrl-Z commits the SMS only while the caller is active.
+		}
 	}
-	err := writeAll(controller.session.lifetime, controller.session.transport, request.payload)
-	if err != nil {
-		controller.failIO("write SMS payload", err)
-		return
-	}
-	if request.ctx.Err() != nil {
-		controller.abortPrompt()
-		return
-	}
-	err = writeAll(controller.session.lifetime, controller.session.transport, []byte{0x1a})
-	if err != nil {
+	if err := writeAll(controller.session.lifetime, controller.session.transport, []byte{terminator}); err != nil {
 		controller.failIO("terminate SMS payload", err)
 		return
 	}
 	request.awaitPrompt = false
 	if err := drainTransport(controller.session.lifetime, controller.session.transport); err != nil {
 		controller.failIO("drain SMS payload", err)
-	}
-}
-
-func (controller *atController) abortPrompt() {
-	if controller.session.stopped() {
-		return
-	}
-	controller.owner.awaitPrompt = false
-	err := writeAll(controller.session.lifetime, controller.session.transport, []byte{0x1b})
-	if err != nil {
-		controller.failIO("abort SMS payload", err)
-		return
-	}
-	if err := drainTransport(controller.session.lifetime, controller.session.transport); err != nil {
-		controller.failIO("drain SMS abort", err)
 	}
 }
 

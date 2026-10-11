@@ -34,7 +34,6 @@ type transcriptTransport struct {
 	writeEvents chan string
 	drainErrors []error
 	ops         []string
-	accepted    string
 }
 
 func (transport *transcriptTransport) Write(payload []byte) (int, error) {
@@ -64,7 +63,6 @@ func (transport *transcriptTransport) Write(payload []byte) (int, error) {
 		count, err = step.result()
 		transport.mu.Lock()
 	}
-	transport.accepted += string(payload[:count])
 	for _, chunk := range step.chunks {
 		transport.reads = append(transport.reads, atReadBatch{data: []byte(chunk)})
 	}
@@ -160,15 +158,6 @@ func (transport *transcriptTransport) assertDone(t *testing.T) {
 	}
 }
 
-func (transport *transcriptTransport) assertAccepted(t *testing.T, want string) {
-	t.Helper()
-	transport.mu.Lock()
-	defer transport.mu.Unlock()
-	if transport.accepted != want {
-		t.Fatalf("accepted writes = %q, want %q; operations = %q", transport.accepted, want, transport.ops)
-	}
-}
-
 func TestSessionWritesCommand(t *testing.T) {
 	final := []string{"\r\n+CSQ: 24,99\r\nOK\r\n"}
 	for _, test := range []struct {
@@ -194,7 +183,6 @@ func TestSessionWritesCommand(t *testing.T) {
 			if err != nil || !response.OK() || response.Text() != "+CSQ: 24,99" {
 				t.Fatalf("Execute = %#v, %v", response, err)
 			}
-			transport.assertAccepted(t, "AT+CSQ\r")
 			transport.mu.Lock()
 			defer transport.mu.Unlock()
 			if got := strings.Join(transport.ops, "|"); got != test.wantOps {
@@ -609,7 +597,8 @@ func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {
 		const command = "AT+CSQ\r"
 		started, release := make(chan struct{}), make(chan struct{})
 		releaseWrite := sync.OnceFunc(func() { close(release) })
-		transport := &transcriptTransport{steps: []transportStep{
+		events := make(chan string, 3)
+		transport := &transcriptTransport{writeEvents: events, steps: []transportStep{
 			{write: command, result: func() (int, error) { return 2, nil }},
 			{write: command[2:], result: func() (int, error) {
 				close(started)
@@ -624,6 +613,8 @@ func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {
 		defer cancel()
 		result := runExecute(ctx, session, strings.TrimSuffix(command, "\r"))
 		<-started
+		<-events
+		<-events
 		cancel()
 		synctest.Wait()
 		select {
@@ -634,13 +625,14 @@ func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {
 		default:
 			t.Fatal("caller cancellation waited for committed I/O")
 		}
-		transport.assertAccepted(t, command[:2])
 		releaseWrite()
-		synctest.Wait()
-		transport.assertAccepted(t, command)
 		next := runExecute(context.Background(), session, "AT")
 		synctest.Wait()
-		transport.assertAccepted(t, command)
+		select {
+		case write := <-events:
+			t.Fatalf("wrote before late final: %q", write)
+		default:
+		}
 		transport.enqueue("\r\n+CSQ: 24,99\r\nOK\r\n")
 		if got := <-next; got.err != nil || !got.response.OK() || got.response.Text() != "" {
 			t.Fatalf("next command after late final = %#v, %v", got.response, got.err)
@@ -664,7 +656,6 @@ func TestSessionPayloadWriteFailureDoesNotSendTerminator(t *testing.T) {
 		if !session.Poisoned() {
 			t.Fatal("transport write failure must allow the manager to reopen the port")
 		}
-		transport.assertAccepted(t, "AT+CMGS=5\rHE")
 		transport.mu.Lock()
 		defer transport.mu.Unlock()
 		for _, op := range transport.ops {

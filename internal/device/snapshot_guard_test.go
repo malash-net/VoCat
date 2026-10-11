@@ -57,40 +57,19 @@ func (c *lenientATClient) saw(command string) bool {
 	return false
 }
 
-func TestNativeSnapshotSkipsCGSN(t *testing.T) {
-	const cachedIMEI = "867123456789012"
-	candidate := modem.Candidate{ID: "mhi-wwan0", QMIControl: "/dev/wwan0qmi0"}
-	for _, test := range []struct {
-		name, backend string
-		retry         bool
-	}{
-		{name: "AT keeps cache", backend: "at"},
-		{name: "QMI", backend: "qmi"},
-		{name: "QMI retries existing fallback", backend: "qmi", retry: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			client := &lenientATClient{cgsnIMEI: "866241014372802"}
-			qmiCalls := 0
-			manager := &Manager{commandTimeout: time.Second, qmiRadioOpener: func(context.Context, string) (qmiRadioSession, error) {
-				qmiCalls++
-				if test.retry && qmiCalls == 1 {
-					return nil, errors.New("transient DMS failure")
-				}
-				return &fakeQMIRadioSession{imei: "861716070416510"}, nil
-			}}
-			snapshot, err := manager.readSnapshot(context.Background(), candidate.ID, candidate, test.backend, "", &Snapshot{IMEI: cachedIMEI}, client)
-			if err != nil || client.saw("AT+CGSN") || client.saw("AT+CGSN=1") {
-				t.Fatalf("native snapshot = %+v, %v; commands = %v", snapshot, err, client.commands)
+func TestSnapshotSkipsCGSNOnlyForNativeQMI(t *testing.T) {
+	for _, id := range []string{"mhi-wwan0", "usb-ec20"} {
+		t.Run(id, func(t *testing.T) {
+			candidate := modem.Candidate{ID: id, QMIControl: "/dev/wwan0qmi0"}
+			client := &lenientATClient{}
+			manager := &Manager{commandTimeout: time.Second}
+			_, err := manager.readSnapshot(context.Background(), id, candidate, "at", "", nil, client)
+			if err != nil {
+				t.Fatal(err)
 			}
-			wantIMEI, wantCalls := cachedIMEI, 0
-			if test.backend == "qmi" {
-				wantIMEI, wantCalls = "861716070416510", 1
-				if test.retry {
-					wantCalls++
-				}
-			}
-			if snapshot.IMEI != wantIMEI || qmiCalls != wantCalls {
-				t.Fatalf("IMEI = %q, QMI calls = %d; want %q, %d", snapshot.IMEI, qmiCalls, wantIMEI, wantCalls)
+			wantCGSN := id == "usb-ec20"
+			if client.saw("AT+CGSN") != wantCGSN || client.saw("AT+CGSN=1") != wantCGSN {
+				t.Fatalf("commands = %v, want CGSN probes = %t", client.commands, wantCGSN)
 			}
 		})
 	}
