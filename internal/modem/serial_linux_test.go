@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 	"testing"
 	"time"
 
@@ -45,45 +44,11 @@ func TestLinuxSerialExecHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func TestLinuxSerialCloseInterruptsWrite(t *testing.T) {
-	fd, peerFD := socketpair(t)
-	transport := &linuxSerialTransport{}
-	transport.fd.Store(int64(fd))
-	defer transport.Close()
-	defer unix.Close(peerFD)
-	fillTransportOutput(t, fd)
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := transport.Write([]byte("AT\r"))
-		writeDone <- err
-	}()
-	waitForTransportReadLock(t, &transport.mu)
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- transport.Close() }()
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Close did not interrupt pending Write")
-	}
-	select {
-	case err := <-writeDone:
-		if !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("Write after Close = %v, want ErrClosed", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Write did not return after Close")
-	}
-}
-
 func TestLinuxSerialDrainWaitsForOutputOrClose(t *testing.T) {
 	for _, action := range []string{"read", "close"} {
 		t.Run(action, func(t *testing.T) {
 			fd, peerFD := socketpair(t)
-			transport := &linuxSerialTransport{}
-			transport.fd.Store(int64(fd))
+			transport := &linuxSerialTransport{fd: fd}
 			defer transport.Close()
 			defer unix.Close(peerFD)
 			payload := []byte("pending output")
@@ -95,19 +60,7 @@ func TestLinuxSerialDrainWaitsForOutputOrClose(t *testing.T) {
 			}
 			drainDone := make(chan error, 1)
 			go func() { drainDone <- transport.Drain() }()
-			deadline := time.Now().Add(time.Second)
-			for transport.mu.TryLock() {
-				transport.mu.Unlock()
-				select {
-				case err := <-drainDone:
-					t.Fatalf("Drain returned with output pending: %v", err)
-				default:
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("Drain did not acquire transport lock")
-				}
-				runtime.Gosched()
-			}
+			waitForTransportReadLock(t, &transport.mu)
 			var wantErr error
 			if action == "close" {
 				wantErr = os.ErrClosed
@@ -148,9 +101,7 @@ func TestLinuxNativeWritePreservesAcceptedCount(t *testing.T) {
 			if kind == "wwan" {
 				transport = &nativeWWANATTransport{fd: fd, readTimeout: -1}
 			} else {
-				serial := &linuxSerialTransport{}
-				serial.fd.Store(int64(fd))
-				transport = serial
+				transport = &linuxSerialTransport{fd: fd}
 			}
 			defer transport.Close()
 			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {

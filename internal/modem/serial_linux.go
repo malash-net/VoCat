@@ -23,7 +23,7 @@ import (
 // a transport that is in use.
 type linuxSerialTransport struct {
 	mu          sync.RWMutex
-	fd          atomic.Int64
+	fd          int
 	readTimeout atomic.Int64
 	closed      atomic.Bool
 }
@@ -39,18 +39,15 @@ func openSerialTransport(path string, baudRate int) (Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := &linuxSerialTransport{}
-	transport.fd.Store(int64(fd))
+	transport := &linuxSerialTransport{fd: fd}
 	transport.readTimeout.Store(int64(100 * time.Millisecond))
 	if err := configureLinuxSerial(fd, speed); err != nil {
 		_ = unix.Close(fd)
-		transport.fd.Store(-1)
 		return nil, err
 	}
 	if err := unix.IoctlSetInt(fd, unix.TIOCEXCL, 0); err != nil &&
 		!errors.Is(err, unix.ENOTTY) && !errors.Is(err, unix.EINVAL) {
 		_ = unix.Close(fd)
-		transport.fd.Store(-1)
 		return nil, fmt.Errorf("claim serial port: %w", err)
 	}
 	return transport, nil
@@ -101,7 +98,7 @@ func linuxBaudRate(rate int) (uint32, bool) {
 }
 
 func (transport *linuxSerialTransport) currentFD() (int, error) {
-	fd := int(transport.fd.Load())
+	fd := transport.fd
 	if transport.closed.Load() || fd < 0 {
 		return -1, os.ErrClosed
 	}
@@ -258,7 +255,8 @@ func (transport *linuxSerialTransport) Close() error {
 	transport.closed.Store(true)
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	fd := int(transport.fd.Swap(-1))
+	fd := transport.fd
+	transport.fd = -1
 	if fd < 0 {
 		return nil
 	}

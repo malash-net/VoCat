@@ -186,7 +186,7 @@ func (manager *Manager) SetCellularIMS(ctx context.Context, id string, mode Cell
 	rebootCtx, cancel := manager.withTimeout(ctx, manager.longTimeout)
 	_, err = client.Execute(rebootCtx, "AT+CFUN=1,1")
 	cancel()
-	if !errors.Is(err, modem.ErrSessionUnsynchronized) {
+	if !isCommandInterrupted(err) {
 		if closeErr := client.Close(); err == nil {
 			err = closeErr
 		}

@@ -205,7 +205,7 @@ func TestSessionParsesResponses(t *testing.T) {
 		{name: "expected registration", command: "AT+CEREG?", text: "+CEREG: 0,5", final: "OK", chunks: []string{"\r\n+CEREG: 0,5\r\nOK\r\n"}},
 		{name: "asynchronous CUSD", command: `AT+CUSD=1,"*100#",15`, final: "OK", urc: `+CUSD: 0,"004F004B",72`, chunks: []string{"\r\n+CUSD: 0,\"004F004B\",72\r\nOK\r\n"}},
 		{name: "command error", command: "AT+CPIN?", final: "+CME ERROR: 10", chunks: []string{"\r\n+CME ERROR: 10\r\n"}},
-		{name: "call final", command: "ATH", final: "NO CARRIER", urc: "NO CARRIER", chunks: []string{"NO CARRIER\r\n"}},
+		{name: "call final", command: "ATD12345;", final: "NO CARRIER", urc: "NO CARRIER", chunks: []string{"NO CARRIER\r\n"}},
 		{name: "ordinary CONNECT line", command: "ATD12345;", text: "CONNECT", final: "OK", chunks: []string{"CONNECT\r\nOK\r\n"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -375,33 +375,37 @@ func TestSessionExecutePromptRejectsUnsafeInput(t *testing.T) {
 	}
 }
 
-func TestSessionQueryKeepsCallURCsUntilFinal(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		transport := &transcriptTransport{steps: []transportStep{{
-			write: "AT+CLCC\r", chunks: []string{"\r\nRING\r\n+CLIP: \"12345\",129\r\nNO CARRIER\r\n"},
-		}}}
-		session := newTestSession(t, transport)
-		transport.enqueue("\r\nCIEV: CALL 1\r\n")
-		synctest.Wait()
-		result := runExecute(context.Background(), session, "AT+CLCC")
-		synctest.Wait()
-		select {
-		case got := <-result:
-			t.Fatalf("call URCs completed CLCC: %#v, %v", got.response, got.err)
-		default:
-		}
-		for _, want := range []string{"CIEV: CALL 1", "RING", `+CLIP: "12345",129`, "NO CARRIER"} {
-			line, err := session.WaitURC(context.Background(), func(line string) bool { return line == want })
-			if err != nil || line != want {
-				t.Fatalf("WaitURC(%q) = %q, %v", want, line, err)
-			}
-		}
-		transport.enqueue("\r\n+CLCC: 1,1,4,0,0,\"12345\",129\r\nOK\r\n")
-		got := <-result
-		if got.err != nil || !got.response.OK() || got.response.Text() != `+CLCC: 1,1,4,0,0,"12345",129` || len(got.response.URCs) != 3 {
-			t.Fatalf("CLCC = %#v, %v", got.response, got.err)
-		}
-	})
+func TestSessionKeepsCallURCsUntilFinal(t *testing.T) {
+	for command, text := range map[string]string{"AT+CLCC": `+CLCC: 1,1,4,0,0,"12345",129`, "ATH": ""} {
+		t.Run(command, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				transport := &transcriptTransport{steps: []transportStep{{
+					write: command + "\r", chunks: []string{"\r\nRING\r\n+CLIP: \"12345\",129\r\nNO CARRIER\r\n"},
+				}}}
+				session := newTestSession(t, transport)
+				transport.enqueue("\r\nCIEV: CALL 1\r\n")
+				synctest.Wait()
+				result := runExecute(context.Background(), session, command)
+				synctest.Wait()
+				select {
+				case got := <-result:
+					t.Fatalf("call URCs completed %s: %#v, %v", command, got.response, got.err)
+				default:
+				}
+				for _, want := range []string{"CIEV: CALL 1", "RING", `+CLIP: "12345",129`, "NO CARRIER"} {
+					line, err := session.WaitURC(context.Background(), func(line string) bool { return line == want })
+					if err != nil || line != want {
+						t.Fatalf("WaitURC(%q) = %q, %v", want, line, err)
+					}
+				}
+				transport.enqueue("\r\n" + text + "\r\nOK\r\n")
+				got := <-result
+				if got.err != nil || !got.response.OK() || got.response.Text() != text || len(got.response.URCs) != 3 {
+					t.Fatalf("%s = %#v, %v", command, got.response, got.err)
+				}
+			})
+		})
+	}
 }
 
 func TestSessionWaitURCDoesNotBlockCommandsOrQueuedCancellation(t *testing.T) {
@@ -488,6 +492,21 @@ func TestSessionDoesNotAssignOldBatchTailToQueuedCommand(t *testing.T) {
 	})
 }
 
+func TestSessionIdlePaddingDoesNotBlockNextCommand(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{steps: []transportStep{
+			{write: "AT\r", chunks: []string{"OK\r\n\x00 \t"}},
+			{write: "AT+CPIN?\r", chunks: []string{"+CPIN: READY\r\nOK\r\n"}},
+		}}
+		session := newTestSession(t, transport)
+		for _, command := range []string{"AT", "AT+CPIN?"} {
+			if response, err := session.Execute(context.Background(), command); err != nil || !response.OK() {
+				t.Fatalf("%s after padding = %#v, %v", command, response, err)
+			}
+		}
+	})
+}
+
 func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 	for _, test := range []struct {
 		name              string
@@ -536,25 +555,35 @@ func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 				} else {
 					cancel()
 				}
-				if got := <-result; !errors.Is(got.err, wantErr) || !errors.Is(got.err, ErrSessionUnsynchronized) || got.response.Final != "" {
+				if got := <-result; !errors.Is(got.err, wantErr) || got.response.Final != "" {
 					t.Fatalf("expired transaction = %#v, %v", got.response, got.err)
 				}
-				if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) || session.Poisoned() {
-					t.Fatalf("AT before late final = %v, poisoned = %t", err, session.Poisoned())
+				queuedCtx, cancelQueued := context.WithTimeout(context.Background(), time.Millisecond)
+				_, err := session.Execute(queuedCtx, "AT")
+				cancelQueued()
+				if !errors.Is(err, ErrCommandTimeout) {
+					t.Fatalf("queued command deadline = %v", err)
 				}
+				next := runExecute(context.Background(), session, "AT+CPIN?")
+				synctest.Wait()
 				if test.prompt && !test.submitted {
 					transport.enqueue("\r\n> ")
 					if write := <-events; write != "\x1b" {
 						t.Fatalf("late prompt write = %q, want ESC", write)
 					}
-					if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) {
-						t.Fatalf("AT before abort acknowledgement = %v", err)
-					}
+					synctest.Wait()
+				}
+				select {
+				case write := <-events:
+					t.Fatalf("wrote before late final: %q", write)
+				default:
+				}
+				if session.Poisoned() {
+					t.Fatal("caller cancellation poisoned the session")
 				}
 				transport.enqueue("\r\nlate reply\r\nOK\r\n")
-				synctest.Wait()
-				if response, err := session.Execute(context.Background(), "AT+CPIN?"); err != nil || !response.OK() || response.Text() != "+CPIN: READY" {
-					t.Fatalf("query after late final = %#v, %v", response, err)
+				if got := <-next; got.err != nil || !got.response.OK() || got.response.Text() != "+CPIN: READY" {
+					t.Fatalf("query after late final = %#v, %v", got.response, got.err)
 				}
 			})
 		})
@@ -626,18 +655,19 @@ func TestSessionCanceledPayloadEchoDoesNotAcknowledgeAbort(t *testing.T) {
 				session := newTestSession(t, transport)
 				response, err := session.ExecutePrompt(ctx, "AT+CMGS=5", []byte(payload))
 				var commandErr *CommandError
-				if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrSessionUnsynchronized) || errors.As(err, &commandErr) || response.Final != "" {
+				if !errors.Is(err, context.Canceled) || errors.As(err, &commandErr) || response.Final != "" {
 					t.Fatalf("canceled payload = %#v, %v", response, err)
 				}
+				next := runExecute(context.Background(), session, "AT+CPIN?")
 				synctest.Wait()
-				if _, err := session.Execute(context.Background(), "AT+CPIN?"); !errors.Is(err, ErrSessionUnsynchronized) {
-					t.Fatalf("CPIN before ESC acknowledgement = %v", err)
+				select {
+				case got := <-next:
+					t.Fatalf("CPIN completed before ESC acknowledgement: %#v, %v", got.response, got.err)
+				default:
 				}
 				transport.enqueue("\r\nERROR\r\n")
-				synctest.Wait()
-				response, err = session.Execute(context.Background(), "AT+CPIN?")
-				if err != nil || !response.OK() || response.Text() != "+CPIN: READY" {
-					t.Fatalf("CPIN after ESC acknowledgement = %#v, %v", response, err)
+				if got := <-next; got.err != nil || !got.response.OK() || got.response.Text() != "+CPIN: READY" {
+					t.Fatalf("CPIN after ESC acknowledgement = %#v, %v", got.response, got.err)
 				}
 			})
 		})
@@ -668,7 +698,7 @@ func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {
 		synctest.Wait()
 		select {
 		case got := <-result:
-			if !errors.Is(got.err, context.Canceled) || !errors.Is(got.err, ErrSessionUnsynchronized) || got.response.Final != "" {
+			if !errors.Is(got.err, context.Canceled) || got.response.Final != "" {
 				t.Fatalf("canceled command = %#v, %v", got.response, got.err)
 			}
 		default:
@@ -678,16 +708,12 @@ func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {
 		releaseWrite()
 		synctest.Wait()
 		transport.assertAccepted(t, command)
-		if _, err := session.Execute(context.Background(), "AT"); !errors.Is(err, ErrSessionUnsynchronized) {
-			t.Fatalf("next command before late final = %v", err)
-		}
-		if session.Poisoned() {
-			t.Fatal("caller cancellation poisoned the session")
-		}
-		transport.enqueue("\r\n+CSQ: 24,99\r\nOK\r\n")
+		next := runExecute(context.Background(), session, "AT")
 		synctest.Wait()
-		if response, err := session.Execute(context.Background(), "AT"); err != nil || !response.OK() {
-			t.Fatalf("next command after late final = %#v, %v", response, err)
+		transport.assertAccepted(t, command)
+		transport.enqueue("\r\n+CSQ: 24,99\r\nOK\r\n")
+		if got := <-next; got.err != nil || !got.response.OK() || got.response.Text() != "" {
+			t.Fatalf("next command after late final = %#v, %v", got.response, got.err)
 		}
 	})
 }

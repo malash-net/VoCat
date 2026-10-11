@@ -2,7 +2,6 @@ package modem
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -36,7 +35,7 @@ func newATRequest(ctx context.Context, command string, payload []byte, interacti
 
 func (request *atRequest) appendLines(lines ...string) {
 	request.mu.Lock()
-	if !request.completed {
+	if request.ctx.Err() == nil {
 		request.response.Lines = append(request.response.Lines, lines...)
 	}
 	request.mu.Unlock()
@@ -44,34 +43,10 @@ func (request *atRequest) appendLines(lines ...string) {
 
 func (request *atRequest) appendURC(line string) {
 	request.mu.Lock()
-	if !request.completed {
+	if request.ctx.Err() == nil {
 		request.response.URCs = append(request.response.URCs, line)
 	}
 	request.mu.Unlock()
-}
-
-func (request *atRequest) setFinal(line string) {
-	request.mu.Lock()
-	if !request.completed {
-		request.response.Final = line
-	}
-	request.mu.Unlock()
-}
-
-func (request *atRequest) copyLines() []string {
-	request.mu.Lock()
-	defer request.mu.Unlock()
-	return append([]string(nil), request.response.Lines...)
-}
-
-func (request *atRequest) resultErrorLocked(err error) error {
-	if request.completed {
-		return request.err
-	}
-	if !request.started.IsZero() && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		return errors.Join(err, ErrSessionUnsynchronized)
-	}
-	return err
 }
 
 func (request *atRequest) resultSnapshot(err error) (Response, error) {
@@ -83,16 +58,26 @@ func (request *atRequest) resultSnapshot(err error) (Response, error) {
 	if !request.completed && !request.started.IsZero() {
 		response.Duration = time.Since(request.started)
 	}
-	return response, request.resultErrorLocked(err)
+	if request.completed {
+		err = request.err
+	}
+	return response, err
 }
 
-func (request *atRequest) complete(err error) {
+func (request *atRequest) complete(final string, err error) {
 	request.mu.Lock()
 	defer request.mu.Unlock()
-	if request.completed {
-		return
+	request.response.Final = final
+	if err == nil {
+		if strings.EqualFold(final, "OK") {
+			if request.awaitPrompt {
+				err = fmt.Errorf("%w: %s", ErrPromptNotReceived, request.command)
+			}
+		} else {
+			err = &CommandError{Command: request.command, Final: final, Lines: append([]string(nil), request.response.Lines...)}
+		}
 	}
-	request.err = request.resultErrorLocked(err)
+	request.err = err
 	if !request.started.IsZero() {
 		request.response.Duration = time.Since(request.started)
 	}
@@ -103,7 +88,7 @@ func (request *atRequest) complete(err error) {
 func isCallCommand(command string) bool {
 	command = strings.ToUpper(strings.TrimSpace(command))
 	switch command {
-	case "ATA", "ATA0", "ATH", "ATH0", "ATH1":
+	case "ATA", "ATA0":
 		return true
 	}
 	return strings.HasPrefix(command, "ATD")
@@ -123,13 +108,10 @@ func (session *Session) runLoop() {
 		if !controller.receivePending() {
 			return
 		}
-		controller.abandonExpired()
 		incoming := session.requests
-		var canceled <-chan struct{}
-		if controller.owner != nil && controller.owner.ctx.Err() == nil {
-			incoming = nil
-			canceled = controller.owner.ctx.Done()
-		} else if controller.owner == nil && len(controller.readBuf) > 0 {
+		// Cancellation releases the caller, not the wire. Queue new commands
+		// until the old final and any buffered trailing input are consumed.
+		if controller.owner != nil || len(controller.readBuf) > 0 {
 			incoming = nil
 		}
 		select {
@@ -141,7 +123,6 @@ func (session *Session) runLoop() {
 			}
 		case request := <-incoming:
 			controller.start(request)
-		case <-canceled:
 		}
 	}
 }
@@ -162,16 +143,12 @@ func (controller *atController) receivePending() bool {
 
 func (controller *atController) start(request *atRequest) {
 	if err := request.ctx.Err(); err != nil {
-		request.complete(commandContextError(err))
-		return
-	}
-	if controller.owner != nil {
-		request.complete(ErrSessionUnsynchronized)
+		request.complete("", commandContextError(err))
 		return
 	}
 	if err := drainTransport(request.ctx, controller.session.transport); err != nil {
 		if request.ctx.Err() != nil {
-			request.complete(commandContextError(request.ctx.Err()))
+			request.complete("", commandContextError(request.ctx.Err()))
 		} else {
 			controller.failIO("drain serial output", err)
 		}
@@ -191,14 +168,14 @@ func (controller *atController) start(request *atRequest) {
 				return
 			}
 		case <-request.ctx.Done():
-			request.complete(commandContextError(request.ctx.Err()))
+			request.complete("", commandContextError(request.ctx.Err()))
 			return
 		case <-controller.session.lifetime.Done():
 			return
 		}
 	}
 	if err := controller.session.beginRequest(request); err != nil {
-		request.complete(err)
+		request.complete("", err)
 		return
 	}
 	controller.owner = request
@@ -212,17 +189,9 @@ func (controller *atController) start(request *atRequest) {
 	}
 }
 
-func (controller *atController) abandonExpired() {
-	if request := controller.owner; request != nil && request.ctx.Err() != nil {
-		// Return to the caller, but keep ownership until the modem's final.
-		request.complete(commandContextError(request.ctx.Err()))
-	}
-}
-
 func (controller *atController) receive(batch atReadBatch) bool {
 	controller.readBuf = append(controller.readBuf, batch.data...)
 	for len(controller.readBuf) > 0 {
-		controller.abandonExpired()
 		if controller.session.stopped() {
 			return false
 		}
@@ -241,6 +210,9 @@ func (controller *atController) receive(batch atReadBatch) bool {
 		}
 		line, ok := popLine(&controller.readBuf)
 		if !ok {
+			if controller.owner == nil && strings.Trim(string(controller.readBuf), "\x00 \t") == "" {
+				controller.readBuf = nil
+			}
 			break
 		}
 		controller.handleLine(line)
@@ -304,25 +276,11 @@ func (controller *atController) finish(final string) {
 	}
 	request := controller.owner
 	controller.owner = nil
-	request.setFinal(final)
-	if err := request.ctx.Err(); err != nil {
-		request.complete(commandContextError(err))
-		return
-	}
-	var err error
-	if strings.EqualFold(final, "OK") {
-		if request.awaitPrompt {
-			err = fmt.Errorf("%w: %s", ErrPromptNotReceived, request.command)
-		}
-	} else {
-		err = &CommandError{Command: request.command, Final: final, Lines: request.copyLines()}
-	}
-	request.complete(err)
+	request.complete(final, commandContextError(request.ctx.Err()))
 }
 
 func (controller *atController) handlePrompt() {
 	request := controller.owner
-	controller.abandonExpired()
 	if request.ctx.Err() != nil {
 		controller.abortPrompt()
 		return
@@ -338,7 +296,6 @@ func (controller *atController) handlePrompt() {
 		return
 	}
 	if request.ctx.Err() != nil {
-		controller.abandonExpired()
 		controller.abortPrompt()
 		return
 	}

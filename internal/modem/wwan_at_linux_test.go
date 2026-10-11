@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -107,46 +108,55 @@ func TestNativeWWANATTransportRejectsClosedTransport(t *testing.T) {
 	}
 }
 
-func TestNativeWWANATTransportCloseInterruptsIO(t *testing.T) {
-	for _, operation := range []string{"read", "write"} {
-		t.Run(operation, func(t *testing.T) {
-			readFD, writeFD := socketpair(t)
-			transport := &nativeWWANATTransport{fd: readFD, readTimeout: -1}
-			defer transport.Close()
-			defer unix.Close(writeFD)
-			if operation == "write" {
-				fillTransportOutput(t, readFD)
-			}
-			ioDone := make(chan error, 1)
-			go func() {
-				var err error
-				if operation == "read" {
-					_, err = transport.Read(make([]byte, 1))
-				} else {
-					_, err = transport.Write([]byte("AT\r"))
+func TestNativeTransportCloseInterruptsIO(t *testing.T) {
+	for _, kind := range []string{"serial", "wwan"} {
+		for _, operation := range []string{"read", "write"} {
+			t.Run(kind+"/"+operation, func(t *testing.T) {
+				fd, peerFD := socketpair(t)
+				serial := &linuxSerialTransport{fd: fd}
+				serial.readTimeout.Store(int64(time.Hour))
+				var transport Transport = serial
+				mu, wantErr := &serial.mu, os.ErrClosed
+				if kind == "wwan" {
+					wwan := &nativeWWANATTransport{fd: fd, readTimeout: -1}
+					transport, mu, wantErr = wwan, &wwan.mu, io.ErrClosedPipe
 				}
-				ioDone <- err
-			}()
-			waitForTransportReadLock(t, &transport.mu)
-			closeDone := make(chan error, 1)
-			go func() { closeDone <- transport.Close() }()
-			select {
-			case err := <-closeDone:
-				if err != nil {
-					t.Fatalf("Close: %v", err)
+				defer transport.Close()
+				defer unix.Close(peerFD)
+				if operation == "write" {
+					fillTransportOutput(t, fd)
 				}
-			case <-time.After(time.Second):
-				t.Fatal("Close did not interrupt pending I/O")
-			}
-			select {
-			case err := <-ioDone:
-				if !errors.Is(err, io.ErrClosedPipe) {
-					t.Fatalf("%s after Close = %v, want ErrClosedPipe", operation, err)
+				ioDone := make(chan error, 1)
+				go func() {
+					var err error
+					if operation == "read" {
+						_, err = transport.Read(make([]byte, 1))
+					} else {
+						_, err = transport.Write([]byte("AT\r"))
+					}
+					ioDone <- err
+				}()
+				waitForTransportReadLock(t, mu)
+				closeDone := make(chan error, 1)
+				go func() { closeDone <- transport.Close() }()
+				select {
+				case err := <-closeDone:
+					if err != nil {
+						t.Fatalf("Close: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("Close did not interrupt pending I/O")
 				}
-			case <-time.After(time.Second):
-				t.Fatal("I/O did not return after Close")
-			}
-		})
+				select {
+				case err := <-ioDone:
+					if !errors.Is(err, wantErr) {
+						t.Fatalf("%s after Close = %v, want %v", operation, err, wantErr)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("I/O did not return after Close")
+				}
+			})
+		}
 	}
 }
 

@@ -50,7 +50,7 @@ func TestParseCellularCSRegistration(t *testing.T) {
 }
 
 func TestSetCellularIMSEnablesAndRebootsOnlyOnce(t *testing.T) {
-	for name, rebootErr := range map[string]error{"success": nil, "unsynchronized": modem.ErrSessionUnsynchronized} {
+	for name, rebootErr := range map[string]error{"success": nil, "timeout": modem.ErrCommandTimeout, "canceled": context.Canceled} {
 		t.Run(name, func(t *testing.T) {
 			client := &transcriptClient{steps: []clientStep{
 				{command: `AT+QCFG="ims"`, response: modem.Response{Lines: []string{`+QCFG: "ims",0,0`}, Final: "OK"}},
@@ -68,7 +68,7 @@ func TestSetCellularIMSEnablesAndRebootsOnlyOnce(t *testing.T) {
 			if rebootErr != nil {
 				wantCloses = 0
 				if manager.devices[id].client != client {
-					t.Fatal("IMS restart discarded the unsynchronized owner")
+					t.Fatal("IMS restart discarded the session before its final")
 				}
 			}
 			if client.closeCount != wantCloses {

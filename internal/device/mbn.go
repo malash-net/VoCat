@@ -431,7 +431,7 @@ func (manager *Manager) ReconcileEC20MBNAfterProfileSwitch(ctx context.Context, 
 	cancelReboot()
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	if errors.Is(rebootErr, modem.ErrSessionUnsynchronized) {
+	if isCommandInterrupted(rebootErr) {
 		manager.setResult(id, state, nil, rebootErr)
 		state.opMu.Unlock()
 		return fmt.Errorf("restart EC20 after MBN selection: %w", rebootErr)
