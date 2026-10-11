@@ -7,9 +7,38 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestNativeWWANATTransportReadEOF(t *testing.T) {
+	fd, peer := socketpair(t)
+	transport := &nativeWWANATTransport{fd: fd, readTimeout: 20 * time.Millisecond}
+	defer transport.Close()
+	defer unix.Close(peer)
+	buffer := make([]byte, 64)
+	if n, err := transport.Read(buffer); n != 0 || err != nil {
+		t.Fatalf("Read timeout = %d, %v; want 0, nil", n, err)
+	}
+	payload := []byte("\r\nRING\r\n")
+	if _, err := unix.Write(peer, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Shutdown(peer, unix.SHUT_RDWR); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		buffer []byte
+		want   []byte
+		err    error
+	}{{buffer, payload, nil}, {nil, nil, nil}, {buffer, nil, io.EOF}} {
+		n, err := transport.Read(step.buffer)
+		if !errors.Is(err, step.err) || !bytes.Equal(step.buffer[:n], step.want) {
+			t.Fatalf("Read = %q, %v; want %q, %v", step.buffer[:n], err, step.want, step.err)
+		}
+	}
+}
 
 func TestNativeWWANATTransportDrainPreservesPendingBytes(t *testing.T) {
 	readFD, writeFD := socketpair(t)

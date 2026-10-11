@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -41,20 +42,35 @@ func (options SessionOptions) withDefaults() SessionOptions {
 // Session serializes all access to one physical AT port. A timed-out command
 // keeps ownership of its response until a later operation consumes its final.
 type Session struct {
-	mu        sync.Mutex
+	gate      chan struct{}
 	transport Transport
 	options   SessionOptions
 	readBuf   []byte
+	readErr   error
+	skipSpace bool
 	urcs      []string
 	pending   *atTransaction
-	closed    bool
-	poisoned  bool
+	poisoned  atomic.Bool
+
+	lifetime  context.Context
+	cancel    context.CancelFunc
+	received  chan atRead
+	readDone  chan struct{}
+	ioDone    chan error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+type atRead struct {
+	data []byte
+	err  error
 }
 
 type atTransaction struct {
 	command        string
 	responsePrefix string
-	payloadEcho    string
+	commandEcho    bool
+	remainingEcho  []string
 	awaitPrompt    bool
 }
 
@@ -72,19 +88,34 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 	if err := transport.SetReadTimeout(options.ReadTimeout); err != nil {
 		return nil, fmt.Errorf("set serial read timeout: %w", err)
 	}
-	return &Session{
-		transport: transport,
-		options:   options,
-	}, nil
+	lifetime, cancel := context.WithCancel(context.Background())
+	session := &Session{
+		transport: transport, options: options,
+		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
+		received: make(chan atRead, 8), readDone: make(chan struct{}),
+	}
+	go session.readLoop()
+	return session, nil
 }
 
 // Poisoned reports whether this session has hit a transport-fatal error and
 // should be discarded rather than reused. It is safe to call concurrently.
 func (session *Session) Poisoned() bool {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	return session.poisoned || session.closed
+	return session.poisoned.Load() || session.lifetime.Err() != nil
 }
+
+func (session *Session) lock(ctx context.Context) error {
+	select {
+	case session.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return commandContextError(ctx.Err())
+	case <-session.lifetime.Done():
+		return ErrSessionClosed
+	}
+}
+
+func (session *Session) unlock() { <-session.gate }
 
 func (session *Session) Execute(ctx context.Context, command string) (Response, error) {
 	command, err := normalizeATCommand(command)
@@ -94,8 +125,10 @@ func (session *Session) Execute(ctx context.Context, command string) (Response, 
 	ctx, cancel := session.commandContext(ctx)
 	defer cancel()
 
-	session.mu.Lock()
-	defer session.mu.Unlock()
+	if err := session.lock(ctx); err != nil {
+		return Response{Command: command}, err
+	}
+	defer session.unlock()
 	return session.executeLocked(ctx, command, nil, false)
 }
 
@@ -116,9 +149,11 @@ func (session *Session) ExecutePrompt(ctx context.Context, command string, paylo
 	ctx, cancel := session.commandContext(ctx)
 	defer cancel()
 
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	return session.executeLocked(ctx, command, payload, true)
+	if err := session.lock(ctx); err != nil {
+		return Response{Command: command}, err
+	}
+	defer session.unlock()
+	return session.executeLocked(ctx, command, append([]byte(nil), payload...), true)
 }
 
 func (session *Session) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -140,18 +175,25 @@ func commandContextError(err error) error {
 
 func (session *Session) executeLocked(ctx context.Context, command string, payload []byte, interactive bool) (response Response, err error) {
 	response.Command = command
-	if session.closed || session.poisoned {
+	if session.Poisoned() {
 		return response, ErrSessionClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return response, commandContextError(err)
 	}
-	// Never assign an old reply (including a partial trailing line) to a new
-	// command. No buffer flush or port reopen can isolate bytes still in flight.
-	for session.pending != nil || len(session.readBuf) > 0 {
+	if err := session.waitIOLocked(ctx); err != nil {
+		return response, err
+	}
+	if err := session.runIOLocked(ctx, func() error { return drainTransport(session.lifetime, session.transport) }); err != nil {
+		return response, fmt.Errorf("drain %s: %w", command, err)
+	}
+	// Never assign an old reply (including idle input and partial trailing
+	// lines) to a new command. Flushing cannot isolate bytes still in flight.
+	for {
+		session.receivePendingLocked()
 		if session.pending == nil {
 			session.readBuf = bytes.TrimLeft(session.readBuf, "\r\n\x00 \t")
-			if len(session.readBuf) == 0 {
+			if len(session.readBuf) == 0 && session.readErr == nil {
 				break
 			}
 		}
@@ -159,31 +201,26 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 			return response, commandContextError(err)
 		}
 	}
-	if err := drainTransport(ctx, session.transport); err != nil {
-		session.poisoned = true
-		return response, fmt.Errorf("drain %s: %w", command, err)
-	}
 	if err := ctx.Err(); err != nil {
 		return response, commandContextError(err)
 	}
 	started := time.Now()
 	defer func() { response.Duration = time.Since(started) }()
 	transaction := &atTransaction{
-		command: command, responsePrefix: expectedResponsePrefix(command),
-		payloadEcho: string(payload), awaitPrompt: interactive,
+		command: command, responsePrefix: expectedResponsePrefix(command), awaitPrompt: interactive,
 	}
 	session.pending = transaction
-	// Once writing starts, finish the command even if the caller cancels;
-	// otherwise the next write could be appended to half an AT command.
-	if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
-		session.poisoned = true
-		return response, fmt.Errorf("write %s: %w", command, err)
-	}
-	if interactive {
-		if err := drainTransport(context.Background(), session.transport); err != nil {
-			session.poisoned = true
-			return response, fmt.Errorf("drain %s: %w", command, err)
+	// Cancellation releases the caller, not a partially written command.
+	if err := session.runIOLocked(ctx, func() error {
+		if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
+			return err
 		}
+		if interactive {
+			return drainTransport(session.lifetime, session.transport)
+		}
+		return nil
+	}); err != nil {
+		return response, fmt.Errorf("write %s: %w", command, err)
 	}
 	for session.pending != nil {
 		if err := session.readNextLocked(ctx, &response, payload); err != nil {
@@ -203,76 +240,153 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	return response, nil
 }
 
+func (session *Session) readLoop() {
+	defer close(session.readDone)
+	buffer := make([]byte, 1024)
+	for session.lifetime.Err() == nil {
+		count, err := session.transport.Read(buffer)
+		if count == 0 && (err == nil || errors.Is(err, syscall.EINTR)) {
+			continue
+		}
+		batch := atRead{data: append([]byte(nil), buffer[:max(count, 0)]...), err: err}
+		if err != nil {
+			session.poisoned.Store(true)
+		}
+		select {
+		case session.received <- batch:
+		case <-session.lifetime.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (session *Session) receivePendingLocked() {
+	for {
+		select {
+		case batch := <-session.received:
+			session.readBuf = append(session.readBuf, batch.data...)
+			session.readErr = batch.err
+		default:
+			return
+		}
+	}
+}
+
+// Only one I/O task may run; even after cancellation, later operations wait
+// for it before accessing the transaction or issuing another write.
+func (session *Session) runIOLocked(ctx context.Context, operation func() error) error {
+	done := make(chan error, 1)
+	session.ioDone = done
+	go func() {
+		err := operation()
+		if err != nil {
+			session.poisoned.Store(true)
+		}
+		done <- err
+	}()
+	return session.waitIOLocked(ctx)
+}
+
+func (session *Session) waitIOLocked(ctx context.Context) error {
+	if session.ioDone == nil {
+		return nil
+	}
+	select {
+	case err := <-session.ioDone:
+		session.ioDone = nil
+		return err
+	case <-ctx.Done():
+		return commandContextError(ctx.Err())
+	case <-session.lifetime.Done():
+		return ErrSessionClosed
+	}
+}
+
 // A nil response means the caller of the pending transaction has already left.
 // Its remaining lines are discarded, but URCs and the final still get processed.
 func (session *Session) readNextLocked(ctx context.Context, response *Response, payload []byte) error {
+	if err := session.waitIOLocked(ctx); err != nil {
+		return err
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if session.skipSpace && len(session.readBuf) > 0 {
+			session.skipSpace = false
+			if session.readBuf[0] == ' ' {
+				session.readBuf = session.readBuf[1:]
+				continue
+			}
+		}
 		if session.pending != nil && session.pending.awaitPrompt && len(session.readBuf) > 0 && session.readBuf[0] == '>' {
 			session.readBuf = session.readBuf[1:]
+			session.skipSpace = true
 			return session.sendPayloadLocked(ctx, response != nil, payload)
 		}
 		if line, ok := popLine(&session.readBuf); ok {
 			session.consumeLineLocked(line, response)
 			return nil
 		}
-		buffer := make([]byte, 1024)
-		count, err := session.transport.Read(buffer)
-		if count > 0 {
-			// Keep bytes even if the deadline expired during Read. The next
-			// operation must still be able to finish this transaction.
-			session.readBuf = append(session.readBuf, buffer[:count]...)
-			continue
+		if session.readErr != nil {
+			session.poisoned.Store(true)
+			return fmt.Errorf("read serial response: %w", session.readErr)
 		}
-		if errors.Is(err, syscall.EINTR) {
-			continue
-		}
-		if err != nil {
-			session.poisoned = true
-			return fmt.Errorf("read serial response: %w", err)
+		select {
+		case batch := <-session.received:
+			session.readBuf = append(session.readBuf, batch.data...)
+			session.readErr = batch.err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-session.lifetime.Done():
+			return ErrSessionClosed
 		}
 	}
 }
 
 func (session *Session) sendPayloadLocked(ctx context.Context, active bool, payload []byte) error {
-	terminator := byte(0x1b) // ESC aborts a prompt whose caller has left.
-	if active && ctx.Err() == nil {
-		if err := writeAll(session.transport, payload); err != nil {
-			session.poisoned = true
-			return fmt.Errorf("write SMS payload: %w", err)
+	return session.runIOLocked(ctx, func() error {
+		terminator := byte(0x1b) // ESC aborts a prompt whose caller has left.
+		if active && ctx.Err() == nil {
+			if session.pending.commandEcho {
+				session.pending.remainingEcho = strings.FieldsFunc(string(payload), func(r rune) bool { return r == '\r' || r == '\n' })
+			}
+			if err := writeAll(session.transport, payload); err != nil {
+				return fmt.Errorf("write SMS payload: %w", err)
+			}
+			if ctx.Err() == nil {
+				terminator = 0x1a
+			}
 		}
-		if ctx.Err() == nil {
-			terminator = 0x1a
+		if err := writeAll(session.transport, []byte{terminator}); err != nil {
+			return fmt.Errorf("terminate SMS payload: %w", err)
 		}
-	}
-	if err := writeAll(session.transport, []byte{terminator}); err != nil {
-		session.poisoned = true
-		return fmt.Errorf("terminate SMS payload: %w", err)
-	}
-	session.pending.awaitPrompt = false
-	if err := drainTransport(context.Background(), session.transport); err != nil {
-		session.poisoned = true
-		return fmt.Errorf("drain SMS payload: %w", err)
-	}
-	return nil
+		session.pending.awaitPrompt = false
+		return drainTransport(session.lifetime, session.transport)
+	})
 }
 
 func (session *Session) consumeLineLocked(line string, response *Response) {
+	pending := session.pending
+	if pending != nil && len(pending.remainingEcho) > 0 && line == pending.remainingEcho[0] {
+		pending.remainingEcho = pending.remainingEcho[1:]
+		return
+	}
 	line = strings.TrimSpace(strings.Trim(line, "\x00"))
 	if line == "" {
 		return
 	}
-	pending := session.pending
 	if pending == nil {
 		if !isFinalResult(line) {
 			session.enqueueURCLocked(line)
 		}
 		return
 	}
-	if strings.EqualFold(line, pending.command) ||
-		(!pending.awaitPrompt && pending.payloadEcho != "" && line == pending.payloadEcho) {
+	if strings.EqualFold(line, pending.command) {
+		pending.commandEcho = true
 		return
 	}
 	callResult := isCallResult(line)
@@ -285,6 +399,7 @@ func (session *Session) consumeLineLocked(line string, response *Response) {
 			return
 		}
 	}
+	pending.remainingEcho = nil
 	if isFinalResult(line) || callResult {
 		session.pending = nil
 		if response != nil {
@@ -296,7 +411,7 @@ func (session *Session) consumeLineLocked(line string, response *Response) {
 }
 
 // WaitURC waits for an unsolicited result matching predicate. Non-matching URCs
-// remain queued for another consumer. Like Execute, it reads under session.mu.
+// remain queued for another consumer. It shares Execute's transaction lock.
 func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool) (string, error) {
 	if predicate == nil {
 		return "", errors.New("modem: URC predicate is required")
@@ -304,9 +419,11 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed || session.poisoned {
+	if err := session.lock(ctx); err != nil {
+		return "", err
+	}
+	defer session.unlock()
+	if session.Poisoned() {
 		return "", ErrSessionClosed
 	}
 	for {
@@ -479,11 +596,16 @@ func writeAll(writer io.Writer, payload []byte) error {
 }
 
 func (session *Session) Close() error {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed {
-		return nil
+	session.closeOnce.Do(func() {
+		session.cancel()
+		session.closeErr = session.transport.Close()
+	})
+	<-session.readDone
+	session.gate <- struct{}{}
+	defer session.unlock()
+	if session.ioDone != nil {
+		<-session.ioDone
+		session.ioDone = nil
 	}
-	session.closed = true
-	return session.transport.Close()
+	return session.closeErr
 }
