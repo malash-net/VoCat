@@ -51,6 +51,10 @@ func TestLinuxSerialDrainWaitsForOutputOrClose(t *testing.T) {
 			transport := &linuxSerialTransport{fd: fd}
 			defer transport.Close()
 			defer unix.Close(peerFD)
+			input := []byte("\r\nRING\r\n")
+			if _, err := unix.Write(peerFD, input); err != nil {
+				t.Fatal(err)
+			}
 			payload := []byte("pending output")
 			if count, err := transport.Write(payload); err != nil || count != len(payload) {
 				t.Fatalf("queue output = %d, %v", count, err)
@@ -88,6 +92,12 @@ func TestLinuxSerialDrainWaitsForOutputOrClose(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatalf("Drain did not return after %s", action)
 			}
+			if action == "read" {
+				buffer := make([]byte, len(input))
+				if count, err := unix.Read(fd, buffer); err != nil || count != len(input) || !bytes.Equal(buffer, input) {
+					t.Fatalf("input after Drain = %q, %d, %v; want %q", buffer, count, err, input)
+				}
+			}
 		})
 	}
 }
@@ -97,17 +107,15 @@ func TestLinuxNativeWritePreservesAcceptedCount(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			fd, peerFD := socketpair(t)
 			defer unix.Close(peerFD)
-			var transport Transport
+			var transport Transport = &linuxSerialTransport{fd: fd}
 			if kind == "wwan" {
 				transport = &nativeWWANATTransport{fd: fd, readTimeout: -1}
-			} else {
-				transport = &linuxSerialTransport{fd: fd}
 			}
 			defer transport.Close()
 			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
 				t.Fatal(err)
 			}
-			payload := bytes.Repeat([]byte("AT\r"), 1<<18)
+			payload := bytes.Repeat([]byte("AT\r"), 1<<15)
 			count, err := transport.Write(payload)
 			if count <= 0 || count >= len(payload) || err != nil {
 				t.Fatalf("partial Write = %d, %v; want 0 < n < %d, nil", count, err, len(payload))
@@ -121,37 +129,6 @@ func TestLinuxNativeWritePreservesAcceptedCount(t *testing.T) {
 				t.Fatalf("unexpected repeated bytes = %d, %v", extra, err)
 			}
 		})
-	}
-}
-
-func TestLinuxSerialDrainPreservesInputAndOutput(t *testing.T) {
-	path, master := linuxTestSerialPath(t)
-	transport, err := openSerialTransport(path, 115200)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer transport.Close()
-	input := []byte("\r\nRING\r\n")
-	if count, err := unix.Write(master, input); err != nil || count != len(input) {
-		t.Fatalf("queue input = %d, %v", count, err)
-	}
-	output := []byte("AT\r")
-	if count, err := transport.Write(output); err != nil || count != len(output) {
-		t.Fatalf("Write = %d, %v", count, err)
-	}
-	if err := transport.Drain(); err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	fds := []unix.PollFd{{Fd: int32(master), Events: unix.POLLIN}}
-	if ready, err := unix.Poll(fds, 1000); err != nil || ready != 1 {
-		t.Fatalf("wait for output = %d, %v", ready, err)
-	}
-	buffer := make([]byte, 64)
-	if count, err := unix.Read(master, buffer); err != nil || !bytes.Equal(buffer[:max(count, 0)], output) {
-		t.Fatalf("read output = %q, %v; want %q", buffer[:max(count, 0)], err, output)
-	}
-	if count, err := transport.Read(buffer); err != nil || !bytes.Equal(buffer[:max(count, 0)], input) {
-		t.Fatalf("read input = %q, %v; want %q", buffer[:max(count, 0)], err, input)
 	}
 }
 

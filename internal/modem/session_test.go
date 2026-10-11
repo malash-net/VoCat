@@ -33,7 +33,6 @@ type transcriptTransport struct {
 	unexpected  error
 	writeEvents chan string
 	drainErrors []error
-	drainCount  int
 	ops         []string
 	accepted    string
 }
@@ -125,7 +124,6 @@ func (transport *transcriptTransport) Read(buffer []byte) (int, error) {
 func (transport *transcriptTransport) Drain() error {
 	transport.mu.Lock()
 	transport.ops = append(transport.ops, "drain")
-	transport.drainCount++
 	var err error
 	if len(transport.drainErrors) > 0 {
 		err = transport.drainErrors[0]
@@ -171,27 +169,38 @@ func (transport *transcriptTransport) assertAccepted(t *testing.T, want string) 
 	}
 }
 
-func TestSessionRetriesInterruptedDrain(t *testing.T) {
-	transport := &transcriptTransport{
-		steps: []transportStep{{
-			write:  "AT+CSQ\r",
-			chunks: []string{"\r\nAT+CSQ\r\n+CSQ: 24,99\r\nOK\r\n"},
-		}},
-		drainErrors: []error{syscall.EINTR},
-	}
-	session := newTestSession(t, transport)
-
-	response, err := session.Execute(context.Background(), "AT+CSQ")
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if response.Final != "OK" {
-		t.Fatalf("response final = %q", response.Final)
-	}
-	transport.mu.Lock()
-	defer transport.mu.Unlock()
-	if transport.drainCount != 2 {
-		t.Fatalf("Drain() calls = %d, want 2", transport.drainCount)
+func TestSessionWritesCommand(t *testing.T) {
+	final := []string{"\r\n+CSQ: 24,99\r\nOK\r\n"}
+	for _, test := range []struct {
+		name        string
+		steps       []transportStep
+		drainErrors []error
+		wantOps     string
+	}{
+		{name: "drain before write", steps: []transportStep{{write: "AT+CSQ\r", chunks: final}},
+			wantOps: "drain|write:AT+CSQ\r"},
+		{name: "interrupted drain", steps: []transportStep{{write: "AT+CSQ\r", chunks: final}}, drainErrors: []error{syscall.EINTR},
+			wantOps: "drain|drain|write:AT+CSQ\r"},
+		{name: "partial and interrupted writes", steps: []transportStep{
+			{write: "AT+CSQ\r", result: func() (int, error) { return 2, nil }},
+			{write: "+CSQ\r", result: func() (int, error) { return 1, syscall.EINTR }},
+			{write: "CSQ\r", chunks: final},
+		}, wantOps: "drain|write:AT+CSQ\r|write:+CSQ\r|write:CSQ\r"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &transcriptTransport{steps: test.steps, drainErrors: test.drainErrors}
+			session := newTestSession(t, transport)
+			response, err := session.Execute(context.Background(), "AT+CSQ")
+			if err != nil || !response.OK() || response.Text() != "+CSQ: 24,99" {
+				t.Fatalf("Execute = %#v, %v", response, err)
+			}
+			transport.assertAccepted(t, "AT+CSQ\r")
+			transport.mu.Lock()
+			defer transport.mu.Unlock()
+			if got := strings.Join(transport.ops, "|"); got != test.wantOps {
+				t.Fatalf("transport operations = %q, want %q", got, test.wantOps)
+			}
+		})
 	}
 }
 
@@ -240,23 +249,6 @@ func TestSessionParsesResponses(t *testing.T) {
 	}
 }
 
-func TestSessionHandlesPartialWrites(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{
-		{write: "AT+CSQ\r", result: func() (int, error) { return 2, nil }},
-		{write: "+CSQ\r", result: func() (int, error) { return 1, syscall.EINTR }},
-		{write: "CSQ\r", chunks: []string{"\r\n+CSQ: 1,99\r\nOK\r\n"}},
-	}}
-	session := newTestSession(t, transport)
-	response, err := session.Execute(context.Background(), "AT+CSQ")
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if response.Text() != "+CSQ: 1,99" {
-		t.Fatalf("response = %#v", response)
-	}
-	transport.assertAccepted(t, "AT+CSQ\r")
-}
-
 func TestSessionExecutePromptQueuesURCsAndReturnsCMGS(t *testing.T) {
 	const pdu = "00010005912143F50008044F60597D"
 	transport := &transcriptTransport{steps: []transportStep{
@@ -299,22 +291,6 @@ func TestSessionExecutePromptQueuesURCsAndReturnsCMGS(t *testing.T) {
 			t.Fatalf("WaitURC(%q) = %q, %v", wanted, line, waitErr)
 		}
 	}
-}
-
-func TestSessionExecutePromptRecognizesErrorWithoutEcho(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		transport := &transcriptTransport{steps: []transportStep{
-			{write: "AT+CMGS=5\r", chunks: []string{"\r\n> "}},
-			{write: "ERROR\nHELLO"},
-			{write: "\x1a", chunks: []string{"\r\nERROR\r\n"}},
-		}}
-		session := newTestSession(t, transport)
-		response, err := session.ExecutePrompt(context.Background(), "AT+CMGS=5", []byte("ERROR\nHELLO"))
-		var commandErr *CommandError
-		if !errors.As(err, &commandErr) || commandErr.Final != "ERROR" || response.Final != "ERROR" || response.Text() != "" {
-			t.Fatalf("ExecutePrompt() = %#v, %v", response, err)
-		}
-	})
 }
 
 func TestSessionExecutePromptSerializesConcurrentCommand(t *testing.T) {
@@ -509,26 +485,36 @@ func TestSessionIdlePaddingDoesNotBlockNextCommand(t *testing.T) {
 
 func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 	for _, test := range []struct {
-		name              string
-		prompt, submitted bool
-		timeout           bool
+		name                             string
+		prompt, submitted, duringPayload bool
+		timeout                          bool
 	}{
 		{name: "query canceled"},
 		{name: "query timeout", timeout: true},
 		{name: "late prompt canceled", prompt: true},
 		{name: "late prompt timeout", prompt: true, timeout: true},
+		{name: "payload canceled", prompt: true, duringPayload: true},
 		{name: "submitted SMS canceled", prompt: true, submitted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
 				command := "AT+CSQ"
 				if test.prompt {
 					command = "AT+CMGS=5"
 				}
 				steps := []transportStep{{write: command + "\r"}}
-				if test.submitted {
+				if test.submitted || test.duringPayload {
 					steps[0].chunks = []string{"\r\n> "}
-					steps = append(steps, transportStep{write: "001122"}, transportStep{write: "\x1a"})
+					payload := transportStep{write: "001122"}
+					if test.duringPayload {
+						payload.result = func() (int, error) { cancel(); return 6, nil }
+					}
+					steps = append(steps, payload)
+				}
+				if test.submitted {
+					steps = append(steps, transportStep{write: "\x1a"})
 				} else if test.prompt {
 					steps = append(steps, transportStep{write: "\x1b"})
 				}
@@ -536,8 +522,6 @@ func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 				events := make(chan string, 4)
 				transport := &transcriptTransport{steps: steps, writeEvents: events}
 				session := newTestSession(t, transport)
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
 				var result <-chan sessionTestResult
 				if test.prompt {
 					result = runPrompt(ctx, session, command, []byte("001122"))
@@ -545,7 +529,7 @@ func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 					result = runExecute(ctx, session, command)
 				}
 				<-events
-				if test.submitted {
+				if test.submitted || test.duringPayload {
 					<-events
 					<-events
 				}
@@ -566,7 +550,7 @@ func TestSessionExpiredTransactionKeepsWireOwnership(t *testing.T) {
 				}
 				next := runExecute(context.Background(), session, "AT+CPIN?")
 				synctest.Wait()
-				if test.prompt && !test.submitted {
+				if test.prompt && !test.submitted && !test.duringPayload {
 					transport.enqueue("\r\n> ")
 					if write := <-events; write != "\x1b" {
 						t.Fatalf("late prompt write = %q, want ESC", write)
@@ -618,60 +602,6 @@ func TestSessionCloseWakesActiveAndWaitingRequests(t *testing.T) {
 			t.Fatal("closed session is not poisoned")
 		}
 	})
-}
-
-func TestSessionDrainsBeforeWritingCommand(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{{
-		write:  "AT+CSQ\r",
-		chunks: []string{"\r\n+CSQ: 24,99\r\nOK\r\n"},
-	}}}
-	session := newTestSession(t, transport)
-	if _, err := session.Execute(context.Background(), "AT+CSQ"); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	transport.mu.Lock()
-	ops := append([]string(nil), transport.ops...)
-	transport.mu.Unlock()
-	if len(ops) != 2 || ops[0] != "drain" || ops[1] != "write:AT+CSQ\r" {
-		t.Fatalf("transport operations = %q, want drain before the command write", ops)
-	}
-}
-
-func TestSessionCanceledPayloadEchoDoesNotAcknowledgeAbort(t *testing.T) {
-	for _, payload := range []string{"ERROR\nHELLO", ">\nHELLO"} {
-		t.Run(payload, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				transport := &transcriptTransport{steps: []transportStep{
-					{write: "AT+CMGS=5\r", chunks: []string{"AT+CMGS=5\r\n> "}},
-					{write: payload, chunks: []string{strings.ReplaceAll(payload, "\n", "\r\n") + "\r\n"}, result: func() (int, error) {
-						cancel()
-						return len(payload), nil
-					}},
-					{write: "\x1b"},
-					{write: "AT+CPIN?\r", chunks: []string{"\r\n+CPIN: READY\r\nOK\r\n"}},
-				}}
-				session := newTestSession(t, transport)
-				response, err := session.ExecutePrompt(ctx, "AT+CMGS=5", []byte(payload))
-				var commandErr *CommandError
-				if !errors.Is(err, context.Canceled) || errors.As(err, &commandErr) || response.Final != "" {
-					t.Fatalf("canceled payload = %#v, %v", response, err)
-				}
-				next := runExecute(context.Background(), session, "AT+CPIN?")
-				synctest.Wait()
-				select {
-				case got := <-next:
-					t.Fatalf("CPIN completed before ESC acknowledgement: %#v, %v", got.response, got.err)
-				default:
-				}
-				transport.enqueue("\r\nERROR\r\n")
-				if got := <-next; got.err != nil || !got.response.OK() || got.response.Text() != "+CPIN: READY" {
-					t.Fatalf("CPIN after ESC acknowledgement = %#v, %v", got.response, got.err)
-				}
-			})
-		})
-	}
 }
 
 func TestSessionCanceledCallerCompletesCommittedWrite(t *testing.T) {

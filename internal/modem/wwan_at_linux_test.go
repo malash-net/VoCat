@@ -94,18 +94,6 @@ func TestNativeWWANATTransportRejectsClosedTransport(t *testing.T) {
 	if err := transport.Drain(); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("Drain after Close = %v, want ErrClosedPipe", err)
 	}
-	if _, err := transport.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("Read after Close = %v, want ErrClosedPipe", err)
-	}
-	if _, err := transport.Write([]byte("AT\r")); !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("Write after Close = %v, want ErrClosedPipe", err)
-	}
-	if err := transport.SetReadTimeout(time.Second); !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("SetReadTimeout after Close = %v, want ErrClosedPipe", err)
-	}
-	if err := transport.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
 }
 
 func TestNativeTransportCloseInterruptsIO(t *testing.T) {

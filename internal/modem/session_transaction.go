@@ -22,8 +22,6 @@ type atRequest struct {
 
 	responsePrefix string
 	awaitPrompt    bool
-	commandEcho    bool
-	remainingEcho  []string
 }
 
 func newATRequest(ctx context.Context, command string, payload []byte, interactive bool) *atRequest {
@@ -233,10 +231,6 @@ func (controller *atController) emitURC(line string) {
 
 func (controller *atController) handleLine(line string) {
 	request := controller.owner
-	if request != nil && len(request.remainingEcho) > 0 && line == request.remainingEcho[0] {
-		request.remainingEcho = request.remainingEcho[1:]
-		return
-	}
 	line = strings.TrimSpace(strings.Trim(line, "\x00"))
 	if line == "" {
 		return
@@ -247,8 +241,8 @@ func (controller *atController) handleLine(line string) {
 		}
 		return
 	}
-	if strings.EqualFold(line, request.command) {
-		request.commandEcho = true
+	if strings.EqualFold(line, request.command) ||
+		(!request.awaitPrompt && len(request.payload) > 0 && line == string(request.payload)) {
 		return
 	}
 	if isCallResult(line) {
@@ -262,7 +256,6 @@ func (controller *atController) handleLine(line string) {
 		controller.emitURC(line)
 		return
 	}
-	request.remainingEcho = nil
 	if isFinalResult(line) {
 		controller.finish(line)
 	} else {
@@ -284,11 +277,6 @@ func (controller *atController) handlePrompt() {
 	if request.ctx.Err() != nil {
 		controller.abortPrompt()
 		return
-	}
-	if request.commandEcho {
-		request.remainingEcho = strings.FieldsFunc(string(request.payload), func(character rune) bool {
-			return character == '\r' || character == '\n'
-		})
 	}
 	err := writeAll(controller.session.lifetime, controller.session.transport, request.payload)
 	if err != nil {
