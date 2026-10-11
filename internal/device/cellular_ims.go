@@ -186,16 +186,14 @@ func (manager *Manager) SetCellularIMS(ctx context.Context, id string, mode Cell
 	rebootCtx, cancel := manager.withTimeout(ctx, manager.longTimeout)
 	_, err = client.Execute(rebootCtx, "AT+CFUN=1,1")
 	cancel()
+	if !errors.Is(err, modem.ErrSessionUnsynchronized) {
+		if closeErr := client.Close(); err == nil {
+			err = closeErr
+		}
+		state.client = nil
+	}
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	if errors.Is(err, modem.ErrSessionUnsynchronized) {
-		manager.setResult(id, state, nil, err)
-		return status, err
-	}
-	if closeErr := client.Close(); err == nil {
-		err = closeErr
-	}
-	state.client = nil
 	manager.setResult(id, state, nil, err)
 	return status, err
 }

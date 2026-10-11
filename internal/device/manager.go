@@ -880,16 +880,14 @@ func (manager *Manager) Reboot(ctx context.Context, id string) error {
 	commandCtx, cancel := manager.withTimeout(ctx, manager.longTimeout)
 	defer cancel()
 	_, err = client.Execute(commandCtx, "AT+CFUN=1,1")
+	if !errors.Is(err, modem.ErrSessionUnsynchronized) {
+		if closeErr := client.Close(); err == nil {
+			err = closeErr
+		}
+		state.client = nil
+	}
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
-	if errors.Is(err, modem.ErrSessionUnsynchronized) {
-		manager.setResult(id, state, nil, err)
-		return err
-	}
-	if closeErr := client.Close(); err == nil {
-		err = closeErr
-	}
-	state.client = nil
 	manager.setResult(id, state, nil, err)
 	return err
 }
@@ -933,7 +931,18 @@ func (manager *Manager) softResetSIMLocked(ctx context.Context, id string, state
 		// 超时或取消时不能确认 CFUN=0 是否已生效，仍尝试恢复到 RF 关闭的工作模式。
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, modem.ErrCommandTimeout) {
 			reloadCtx, cancelReload := context.WithTimeout(context.WithoutCancel(ctx), manager.commandTimeout)
-			_, reloadErr := client.Execute(reloadCtx, "AT+CFUN=4")
+			var reloadErr error
+			for {
+				_, reloadErr = client.Execute(reloadCtx, "AT+CFUN=4")
+				if !errors.Is(reloadErr, modem.ErrSessionUnsynchronized) || reloadCtx.Err() != nil {
+					break
+				}
+				// Wait for the late CFUN=0 final without reopening its AT session.
+				select {
+				case <-reloadCtx.Done():
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
 			cancelReload()
 			err = errors.Join(err, reloadErr)
 		}

@@ -195,79 +195,48 @@ func TestSessionRetriesInterruptedDrain(t *testing.T) {
 	}
 }
 
-func TestSessionSeparatesInterleavedURCs(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{{
-		write: "AT+CSQ\r",
-		chunks: []string{
-			"\r\nAT+CSQ\r\n+CMTI: \"SM\",7\r\n",
-			"+CSQ: 24,99\r\nOK\r\n",
-		},
-	}}}
-	session := newTestSession(t, transport)
-	response, err := session.Execute(context.Background(), "AT+CSQ")
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if got := response.Text(); got != "+CSQ: 24,99" {
-		t.Fatalf("response = %q", got)
-	}
-	if len(response.URCs) != 1 || response.URCs[0] != `+CMTI: "SM",7` {
-		t.Fatalf("URCs = %#v", response.URCs)
-	}
-	urc, err := session.WaitURC(context.Background(), func(line string) bool {
-		return line == `+CMTI: "SM",7`
-	})
-	if err != nil || urc == "" {
-		t.Fatalf("WaitURC = %q, %v", urc, err)
-	}
-}
-
-func TestSessionKeepsExpectedRegistrationLineInResponse(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{{
-		write:  "AT+CEREG?\r",
-		chunks: []string{"\r\n+CEREG: 0,5\r\nOK\r\n"},
-	}}}
-	session := newTestSession(t, transport)
-	response, err := session.Execute(context.Background(), "AT+CEREG?")
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if response.Text() != "+CEREG: 0,5" || len(response.URCs) != 0 {
-		t.Fatalf("response = %#v", response)
-	}
-}
-
-func TestSessionQueuesCUSDThatArrivesBeforeOK(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{{
-		write:  "AT+CUSD=1,\"*100#\",15\r",
-		chunks: []string{"\r\n+CUSD: 0,\"004F004B\",72\r\nOK\r\n"},
-	}}}
-	session := newTestSession(t, transport)
-	response, err := session.Execute(context.Background(), `AT+CUSD=1,"*100#",15`)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if len(response.URCs) != 1 {
-		t.Fatalf("URCs = %#v", response.URCs)
-	}
-	urc, err := session.WaitURC(context.Background(), func(line string) bool {
-		return len(line) >= 6 && line[:6] == "+CUSD:"
-	})
-	if err != nil || urc != `+CUSD: 0,"004F004B",72` {
-		t.Fatalf("WaitURC = %q, %v", urc, err)
-	}
-}
-
-func TestSessionReturnsTypedCommandError(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{{
-		write:  "AT+CPIN?\r",
-		chunks: []string{"\r\n+CME ERROR: 10\r\n"},
-	}}}
-	session := newTestSession(t, transport)
-	_, err := session.Execute(context.Background(), "AT+CPIN?")
-	var commandErr *CommandError
-	if !errors.As(err, &commandErr) || commandErr.Final != "+CME ERROR: 10" {
-		t.Fatalf("error = %#v", err)
+func TestSessionParsesResponses(t *testing.T) {
+	for _, test := range []struct {
+		name, command, text, final, urc string
+		chunks                          []string
+	}{
+		{name: "interleaved URC and split line", command: "AT+CSQ", text: "+CSQ: 24,99", final: "OK", urc: `+CMTI: "SM",7`,
+			chunks: []string{"\r\nAT+CSQ\r", "\n+CMTI: \"SM\",7\r\n+CS", "Q: 24,99\r\nOK\r", "\n"}},
+		{name: "expected registration", command: "AT+CEREG?", text: "+CEREG: 0,5", final: "OK", chunks: []string{"\r\n+CEREG: 0,5\r\nOK\r\n"}},
+		{name: "asynchronous CUSD", command: `AT+CUSD=1,"*100#",15`, final: "OK", urc: `+CUSD: 0,"004F004B",72`, chunks: []string{"\r\n+CUSD: 0,\"004F004B\",72\r\nOK\r\n"}},
+		{name: "command error", command: "AT+CPIN?", final: "+CME ERROR: 10", chunks: []string{"\r\n+CME ERROR: 10\r\n"}},
+		{name: "call final", command: "ATH", final: "NO CARRIER", urc: "NO CARRIER", chunks: []string{"NO CARRIER\r\n"}},
+		{name: "ordinary CONNECT line", command: "ATD12345;", text: "CONNECT", final: "OK", chunks: []string{"CONNECT\r\nOK\r\n"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &transcriptTransport{steps: []transportStep{{write: test.command + "\r", chunks: test.chunks}}}
+			session := newTestSession(t, transport)
+			response, err := session.Execute(context.Background(), test.command)
+			if response.Text() != test.text || response.Final != test.final || session.Poisoned() {
+				t.Fatalf("Execute = %#v, %v", response, err)
+			}
+			var commandErr *CommandError
+			if test.final == "OK" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.As(err, &commandErr) || commandErr.Command != test.command || commandErr.Final != test.final {
+				t.Fatalf("command error = %v", err)
+			}
+			if test.urc == "" {
+				if len(response.URCs) != 0 {
+					t.Fatalf("unexpected URCs: %q", response.URCs)
+				}
+			} else {
+				if len(response.URCs) != 1 || response.URCs[0] != test.urc {
+					t.Fatalf("URCs = %q, want %q", response.URCs, test.urc)
+				}
+				urc, err := session.WaitURC(context.Background(), func(line string) bool { return line == test.urc })
+				if err != nil || urc != test.urc {
+					t.Fatalf("WaitURC = %q, %v", urc, err)
+				}
+			}
+		})
 	}
 }
 
@@ -294,7 +263,7 @@ func TestSessionExecutePromptQueuesURCsAndReturnsCMGS(t *testing.T) {
 		{
 			write: "AT+CMGS=14\r",
 			chunks: []string{
-				"\r\nAT+CMGS=14\r\n+CMTI: \"SM\",7\r\n> ",
+				"\r", "\nAT+CMGS=14\r\n+CMTI: \"SM\",7\r", "\n>", " ",
 			},
 		},
 		{write: pdu},
@@ -620,23 +589,6 @@ func TestSessionCloseWakesActiveAndWaitingRequests(t *testing.T) {
 			t.Fatal("closed session is not poisoned")
 		}
 	})
-}
-
-func TestSessionCallCommandResults(t *testing.T) {
-	transport := &transcriptTransport{steps: []transportStep{
-		{write: "ATH\r", chunks: []string{"NO CARRIER\r\n"}},
-		{write: "ATD12345;\r", chunks: []string{"CONNECT\r\nOK\r\n"}},
-	}}
-	session := newTestSession(t, transport)
-	response, err := session.Execute(context.Background(), "ATH")
-	var commandErr *CommandError
-	if !errors.As(err, &commandErr) || commandErr.Command != "ATH" || commandErr.Final != "NO CARRIER" || response.Final != "NO CARRIER" {
-		t.Fatalf("call final = %#v, %v", response, err)
-	}
-	response, err = session.Execute(context.Background(), "ATD12345;")
-	if err != nil || !response.OK() || response.Text() != "" || session.Poisoned() {
-		t.Fatalf("voice CONNECT = %#v, %v", response, err)
-	}
 }
 
 func TestSessionDrainsBeforeWritingCommand(t *testing.T) {

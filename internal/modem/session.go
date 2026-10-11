@@ -45,8 +45,6 @@ type Session struct {
 	options   SessionOptions
 	requests  chan *atRequest
 	received  chan atReadBatch
-	stop      chan struct{}
-	stopOnce  sync.Once
 	closeOnce sync.Once
 	workers   sync.WaitGroup
 
@@ -81,9 +79,8 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 		cancel:     cancel,
 		transport:  transport,
 		options:    options,
-		requests:   make(chan *atRequest, 16),
+		requests:   make(chan *atRequest),
 		received:   make(chan atReadBatch, 8),
-		stop:       make(chan struct{}),
 		urcChanged: make(chan struct{}),
 	}
 	session.workers.Add(2)
@@ -93,8 +90,6 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 }
 
 func (session *Session) Poisoned() bool {
-	session.mu.Lock()
-	defer session.mu.Unlock()
 	return session.stopped()
 }
 
@@ -129,7 +124,7 @@ func (session *Session) submit(ctx context.Context, command string, payload []by
 	if err := ctx.Err(); err != nil {
 		return failedResponse(command, commandContextError(err))
 	}
-	if err := session.Err(); err != nil {
+	if err := session.err(); err != nil {
 		return failedResponse(command, err)
 	}
 	request := newATRequest(ctx, command, payload, interactive)
@@ -137,19 +132,16 @@ func (session *Session) submit(ctx context.Context, command string, payload []by
 	case session.requests <- request:
 	case <-ctx.Done():
 		return failedResponse(command, commandContextError(ctx.Err()))
-	case <-session.stop:
-		return failedResponse(command, session.Err())
+	case <-session.lifetime.Done():
+		return failedResponse(command, session.err())
 	}
 	select {
 	case <-request.done:
-		result := request.resultSnapshot(nil)
-		return result.response, result.err
+		return request.resultSnapshot(nil)
 	case <-ctx.Done():
-		result := request.resultSnapshot(commandContextError(ctx.Err()))
-		return result.response, result.err
-	case <-session.stop:
-		result := request.resultSnapshot(session.Err())
-		return result.response, result.err
+		return request.resultSnapshot(commandContextError(ctx.Err()))
+	case <-session.lifetime.Done():
+		return request.resultSnapshot(session.err())
 	}
 }
 
@@ -179,7 +171,7 @@ func (session *Session) readLoop() {
 	buffer := make([]byte, 1024)
 	for {
 		select {
-		case <-session.stop:
+		case <-session.lifetime.Done():
 			return
 		default:
 		}
@@ -203,7 +195,7 @@ func (session *Session) readLoop() {
 		}
 		select {
 		case session.received <- batch:
-		case <-session.stop:
+		case <-session.lifetime.Done():
 			return
 		}
 		if err != nil {
@@ -265,13 +257,13 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 		case <-notify:
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-session.stop:
-			return "", session.Err()
+		case <-session.lifetime.Done():
+			return "", session.err()
 		}
 	}
 }
 
-func (session *Session) Err() error {
+func (session *Session) err() error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	return session.unavailableErrorLocked()
@@ -298,20 +290,12 @@ func (session *Session) beginRequest(request *atRequest) error {
 	if err := request.ctx.Err(); err != nil {
 		return commandContextError(err)
 	}
-	if request.completed {
-		return ErrSessionClosed
-	}
 	request.started = time.Now()
 	return nil
 }
 
 func (session *Session) stopped() bool {
-	select {
-	case <-session.stop:
-		return true
-	default:
-		return false
-	}
+	return session.lifetime.Err() != nil
 }
 
 func (session *Session) terminate(err error, explicit bool) {
@@ -322,13 +306,7 @@ func (session *Session) terminate(err error, explicit bool) {
 	if err != nil && session.failure == nil {
 		session.failure = err
 	}
-	// A closed stop channel wakes every pending WaitURC and submit; the
-	// unavailableError check inside them returns before they can select on
-	// urcChanged again, so nothing needs resetting here.
-	session.stopOnce.Do(func() {
-		session.cancel()
-		close(session.stop)
-	})
+	session.cancel()
 	session.mu.Unlock()
 	session.closeOnce.Do(func() {
 		closeErr := session.transport.Close()
@@ -360,6 +338,23 @@ func drainTransport(ctx context.Context, transport Transport) error {
 		}
 		return err
 	}
+}
+
+func popLine(buffer *[]byte) (string, bool) {
+	data := *buffer
+	for index, character := range data {
+		if character != '\r' && character != '\n' {
+			continue
+		}
+		line := string(data[:index])
+		next := index + 1
+		for next < len(data) && (data[next] == '\r' || data[next] == '\n') {
+			next++
+		}
+		*buffer = data[next:]
+		return line, true
+	}
+	return "", false
 }
 
 func normalizeATCommand(command string) (string, error) {

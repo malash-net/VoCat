@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"vocat/internal/modem"
 )
@@ -120,13 +121,32 @@ func TestSIMPowerUpSurvivesCanceledRequest(t *testing.T) {
 }
 
 func TestSIMPowerUpAttemptedAfterUnconfirmedPowerDown(t *testing.T) {
-	client := &transcriptClient{steps: []clientStep{
-		{command: "AT+CFUN=0", err: modem.ErrCommandTimeout},
-		{command: "AT+CFUN=4", response: okResponse()},
-	}}
-	manager, id := newStartedTestManager(t, client)
-	if err := manager.softResetForProfileSwitch(context.Background(), id); !errors.Is(err, modem.ErrCommandTimeout) {
-		t.Fatalf("reset error = %v, want timeout", err)
+	for _, test := range []struct {
+		name       string
+		reloadErrs []error
+		wantErr    error
+		timeout    time.Duration
+	}{
+		{name: "ready", reloadErrs: []error{nil}},
+		{name: "late final", reloadErrs: []error{modem.ErrSessionUnsynchronized, nil}},
+		{name: "transport failure", reloadErrs: []error{modem.ErrSessionClosed}, wantErr: modem.ErrSessionClosed},
+		{name: "recovery timeout", reloadErrs: []error{modem.ErrSessionUnsynchronized}, wantErr: context.DeadlineExceeded, timeout: 10 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			steps := []clientStep{{command: "AT+CFUN=0", err: errors.Join(modem.ErrCommandTimeout, modem.ErrSessionUnsynchronized)}}
+			for _, err := range test.reloadErrs {
+				steps = append(steps, clientStep{command: "AT+CFUN=4", response: okResponse(), err: err})
+			}
+			client := &transcriptClient{steps: steps}
+			manager, id := newStartedTestManager(t, client)
+			if test.timeout > 0 {
+				manager.commandTimeout = test.timeout
+			}
+			err := manager.softResetForProfileSwitch(context.Background(), id)
+			if !errors.Is(err, modem.ErrCommandTimeout) || test.wantErr != nil && !errors.Is(err, test.wantErr) {
+				t.Fatalf("reset error = %v, want timeout and %v", err, test.wantErr)
+			}
+			client.assertDone(t)
+		})
 	}
-	client.assertDone(t)
 }
