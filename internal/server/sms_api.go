@@ -1119,6 +1119,15 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-notifications:
 		case <-ticker.C:
 		}
+		// One scan covers pending triggers; arrivals during the scan stay queued.
+		select {
+		case <-notifications:
+		default:
+		}
+		select {
+		case <-ticker.C:
+		default:
+		}
 		s.syncModemSMS(ctx, "")
 	}
 }
