@@ -24,6 +24,8 @@ type Store struct {
 	logMu        sync.Mutex
 	logClearedAt time.Time
 	logMinLevel  string
+
+	smsNotifications chan struct{}
 }
 
 type Admin struct {
@@ -81,7 +83,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return closeOnError(fmt.Errorf("secure sqlite file: %w", err))
 		}
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, smsNotifications: make(chan struct{}, 1)}, nil
 }
 
 func prepareDatabasePath(path string) error {

@@ -1099,13 +1099,16 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	}
 }
 
-// StartSMSSyncLoop periodically persists inbound cellular SMS even when no
-// client has the SMS page open. The first tick is delayed so startup SIM/AKA
-// work gets exclusive use of the modem. Stable VoWiFi sessions still scan SM
-// and ME as a catch-up path for messages delivered while the card was offline.
+// StartSMSSyncLoop persists inbound cellular SMS on modem notifications and
+// periodic catch-up scans. The first timer tick remains delayed for startup
+// SIM/AKA work; syncModemSMS also defers scans while VoWiFi is initializing.
 func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
+	}
+	var notifications <-chan struct{}
+	if source, ok := s.devices.(interface{ SMSNotifications() <-chan struct{} }); ok {
+		notifications = source.SMSNotifications()
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1113,9 +1116,10 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-notifications:
 		case <-ticker.C:
-			s.syncModemSMS(ctx, "")
 		}
+		s.syncModemSMS(ctx, "")
 	}
 }
 
