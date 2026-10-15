@@ -62,17 +62,19 @@ func (s *Store) SaveSMSMessageWithResult(ctx context.Context, value SMSMessage) 
 	}, nil
 }
 
-// SMSNotifications provides coalesced wakeups for one consumer of newly
-// committed inbound messages. The database remains the source of truth.
+// SMSNotifications returns a channel closed when new inbound messages commit.
+// Each consumer must fetch it before querying messages on every scheduling tick.
 func (s *Store) SMSNotifications() <-chan struct{} {
+	s.smsNotificationsMu.Lock()
+	defer s.smsNotificationsMu.Unlock()
 	return s.smsNotifications
 }
 
 func (s *Store) signalSMSNotification() {
-	select {
-	case s.smsNotifications <- struct{}{}:
-	default:
-	}
+	s.smsNotificationsMu.Lock()
+	defer s.smsNotificationsMu.Unlock()
+	close(s.smsNotifications)
+	s.smsNotifications = make(chan struct{})
 }
 
 func saveSMSMessage(
