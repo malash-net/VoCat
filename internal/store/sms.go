@@ -14,6 +14,7 @@ import (
 type contextQueryExecer interface {
 	contextExecer
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 // SaveSMSMessage inserts a new message or updates an existing record. A
@@ -111,6 +112,10 @@ func saveSMSMessage(
 		return SMSMessage{}, fmt.Errorf("normalize SMS extra data: %w", err)
 	}
 	now := time.Now().UTC()
+	extra, metadataChanged, err := resolveModemSMS(ctx, executor, &value, extra, now)
+	if err != nil {
+		return SMSMessage{}, err
+	}
 
 	// Concatenated (long) SMS arrive as one segment per delivery. Ingest points
 	// address the whole message with a stable "concat:" message id and carry the
@@ -158,9 +163,12 @@ func saveSMSMessage(
 			}
 			preserveSMSSubscriptionIdentity(&value, existing)
 			if !changed {
-				if value.Read != existing.Read {
-					if _, err := executor.ExecContext(ctx, `UPDATE sms_messages SET is_read = ?, updated_at = ? WHERE id = ?`, boolInt(value.Read), now.Unix(), existing.ID); err != nil {
-						return SMSMessage{}, fmt.Errorf("update concatenated SMS read state: %w", err)
+				if value.Read != existing.Read || metadataChanged {
+					if metadataChanged {
+						existing.Extra = mergedExtra
+					}
+					if _, err := executor.ExecContext(ctx, `UPDATE sms_messages SET is_read = ?, extra_json = ?, updated_at = ? WHERE id = ?`, boolInt(value.Read), string(existing.Extra), now.Unix(), existing.ID); err != nil {
+						return SMSMessage{}, fmt.Errorf("update concatenated SMS metadata: %w", err)
 					}
 					existing.Read = value.Read
 				}

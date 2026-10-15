@@ -721,10 +721,8 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			snapshotString(currentEntry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }),
 			config.ModemIMEI,
 		)
-		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
-		clearGroups := make(map[string]*modemSMSCleanupGroup)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -756,74 +754,24 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			if peer == "" {
 				continue
 			}
-			timestamp := time.Now().UTC()
-			if message.ServiceCenterTimestamp != nil {
-				timestamp = message.ServiceCenterTimestamp.UTC()
-			} else if message.DischargeTimestamp != nil {
-				timestamp = message.DischargeTimestamp.UTC()
+			record, recordErr := modemSMSRecord(message)
+			if recordErr != nil {
+				s.logger.Warn("prepare modem SMS metadata failed", "device_id", config.ID, "error", recordErr)
+				continue
 			}
-			direction := "inbound"
-			if message.Direction == device.SMSDirectionSubmitted {
-				direction = "outbound"
-			}
-			messageID := modemSMSMessageID(message, modemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
-			var clearGroup *modemSMSCleanupGroup
-			if autoClear {
-				clearGroup = clearGroups[messageID]
-				if clearGroup == nil {
-					clearGroup = &modemSMSCleanupGroup{}
-					clearGroups[messageID] = clearGroup
-				}
-				clearGroup.messages = append(clearGroup.messages, message)
-			}
-			extra, _ := json.Marshal(map[string]any{
-				"modem_index":        message.Index,
-				"storage":            message.Storage,
-				"storage_status":     message.StorageStatus,
-				"encoding":           message.Encoding,
-				"concat":             message.Concat,
-				"decode_error":       message.DecodeError,
-				"status_code":        message.StatusCode,
-				"message_reference":  message.MessageReference,
-				"delivery_status":    message.DeliveryStatus,
-				"data_coding_scheme": message.DataCodingScheme,
-				// Every AT modem periodically rescans persistent SMS storage. Keep a
-				// completed multipart row's cursor stable when a decoder presents a
-				// segment differently on a later pass, otherwise notification
-				// providers can treat the old message as newly inserted.
-				"keep_durable_id_on_rescan": true,
-			})
-			saveResult, saveErr := s.store.SaveSMSMessageWithResult(ctx, store.SMSMessage{
-				MessageID:     messageID,
-				DeviceID:      config.ID,
-				ModemIMEI:     modemIMEI,
-				ICCID:         identityAfter.ICCID,
-				IMSI:          identityAfter.IMSI,
-				LocalPhone:    localPhone,
-				Peer:          peer,
-				Direction:     direction,
-				Body:          message.Text,
-				Timestamp:     timestamp,
-				Status:        string(message.StorageStatus),
-				Source:        "cellular_at",
-				PartsTotal:    concatTotal(message.Concat),
-				DeliveryState: message.DeliveryStatus,
-				Read:          message.StorageStatus == device.SMSStatusReceivedRead,
-				Extra:         extra,
-			})
+			record.MessageID = modemSMSMessageID(message, modemIMEI, config.ID, peer, "")
+			record.DeviceID, record.ModemIMEI = config.ID, modemIMEI
+			record.ICCID, record.IMSI, record.LocalPhone = identityAfter.ICCID, identityAfter.IMSI, localPhone
+			saveResult, saveErr := s.store.SaveSMSMessageWithResult(ctx, record)
 			if saveErr != nil {
-				if clearGroup != nil {
-					clearGroup.failed = true
-				}
 				s.logger.Warn("persist modem SMS failed", "category", "sms", "device_id", config.ID, "raw_error", saveErr)
 				continue
 			}
-			saved := saveResult.Message
-			ready := store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra)
-			if clearGroup != nil {
-				clearGroup.ready = ready
+			if autoClear {
+				clearSlots = appendModemSMSSlot(clearSlots, message)
 			}
-			if saveResult.Inserted && saved.Direction == "inbound" && ready {
+			if saved := saveResult.Message; saveResult.Inserted && saved.Direction == "inbound" &&
+				store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra) {
 				s.logger.Info("cellular SMS received",
 					"category", "sms", "event", "sms.received",
 					"device_id", config.ID, "peer", saved.Peer,
@@ -833,25 +781,9 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			}
 		}
 		if autoClear {
-			// Retain the first slot until the whole group is durable, so later
-			// scans keep the same concat identity for segments arriving separately.
-			for _, group := range clearGroups {
-				if !group.ready || group.failed {
-					continue
-				}
-				for _, message := range group.messages {
-					clearSlots = appendModemSMSSlot(clearSlots, message)
-				}
-			}
 			s.clearPersistedModemSMS(ctx, physicalID, config.ID, clearSlots)
 		}
 	}
-}
-
-type modemSMSCleanupGroup struct {
-	messages []device.SMSMessage
-	ready    bool
-	failed   bool
 }
 
 type modemSMSSlot struct {
@@ -913,11 +845,8 @@ func modemSMSMessageID(message device.SMSMessage, modemIMEI, deviceID, peer, con
 		hex.EncodeToString(digest[:8]),
 	)
 	if message.Concat != nil && message.Concat.Total > 1 {
-		// A segment of a carrier-split long SMS. Address the whole message
-		// with a storage-generation id so SaveSMSMessage folds every segment
-		// into one row without colliding with an older message that reused the
-		// same UDH reference. SM and ME can expose duplicate copies of the same
-		// slots, so the generation uses the first segment index, not storage.
+		// This is only a legacy lookup hint. Store resolves persistent AT
+		// generations from segment evidence, never from storage-slot ordering.
 		source := firstNonEmpty(concatSource, "cellular_at")
 		messageID = store.StableConcatMessageID(
 			source, modemIMEI, deviceID, peer,
@@ -969,12 +898,10 @@ func (s *Server) smsLocalPhone(
 	return ""
 }
 
-// modemSMSConcatSources identifies every multipart group by the storage slot of
-// its first segment. Carrier and modem storage can interleave unrelated SMS
-// between segments, so deriving that slot through index arithmetic separates a
-// single long SMS into several rows. The real first-segment slot also keeps
-// messages that reuse the same UDH reference in distinct groups.
-func modemSMSConcatSources(messages []device.SMSMessage) map[string]string {
+// legacyModemSMSConcatSources reproduces old slot-derived IDs only as migration
+// hints. The store verifies legacy content and delivery evidence before reuse;
+// new messages are grouped by persistent metadata, not by these slot hints.
+func legacyModemSMSConcatSources(messages []device.SMSMessage) map[string]string {
 	firstSlots := make(map[string][]int)
 	for _, message := range messages {
 		if message.Concat == nil || message.Concat.Total <= 1 || message.Concat.Sequence != 1 {
@@ -1071,7 +998,7 @@ func (s *Server) deleteModemSMS(ctx context.Context, stored store.SMSMessage) er
 		// Removed devices leave SMS history that can be deleted locally.
 		return nil
 	}
-	_, physicalID, present := s.physicalForConfig(config)
+	entry, physicalID, present := s.physicalForConfig(config)
 	if !present {
 		return device.ErrNotFound
 	}
@@ -1083,14 +1010,33 @@ func (s *Server) deleteModemSMS(ctx context.Context, stored store.SMSMessage) er
 	}
 	s.rememberSMSStorage(config.ID, listing.Storage)
 	modemMessages := listing.Messages
-	concatSources := modemSMSConcatSources(modemMessages)
+	concatSources := legacyModemSMSConcatSources(modemMessages)
 	locations := make(map[string]device.SMSMessage)
 	for _, message := range modemMessages {
 		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" || modemSMSMessageID(message, stored.ModemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)]) != stored.MessageID {
+		if peer == "" {
 			continue
 		}
-		locations[modemSMSStorageKey(message)] = message
+		legacyID := modemSMSMessageID(message, stored.ModemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
+		matches := legacyID == stored.MessageID
+		if strings.HasPrefix(stored.MessageID, store.ConcatMessageIDPrefix) {
+			if peer != stored.Peer {
+				continue
+			}
+			observed, recordErr := modemSMSRecord(message)
+			if recordErr != nil {
+				return fmt.Errorf("prepare modem SMS before deletion: %w", recordErr)
+			}
+			identity := smsIdentityFromSnapshot(entry.Snapshot)
+			observed.MessageID = legacyID
+			observed.DeviceID = config.ID
+			observed.ModemIMEI = firstNonEmpty(snapshotString(entry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }), config.ModemIMEI)
+			observed.ICCID, observed.IMSI = identity.ICCID, identity.IMSI
+			matches = store.ModemSMSMatches(stored, observed)
+		}
+		if matches {
+			locations[modemSMSStorageKey(message)] = message
+		}
 	}
 	for _, message := range locations {
 		deleteContext, cancelDelete := context.WithTimeout(ctx, 10*time.Second)
