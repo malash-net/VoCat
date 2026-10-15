@@ -38,20 +38,110 @@ func modemTestPart(t *testing.T, sequence int, body, hash string, overrideSCTS .
 	}
 }
 
+func TestModemSMSDoesNotCrossServiceCenterTimes(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	aTime := time.Unix(1_700_000_000, 0).UTC()
+	bTime := aTime.Add(2 * time.Hour)
+	parts := []SMSMessage{
+		modemTestPart(t, 2, "A2", "a2", &aTime),
+		modemTestPart(t, 1, "B1", "b1", &bTime),
+		modemTestPart(t, 2, "B2", "b2", &bTime),
+		modemTestPart(t, 1, "A1", "a1", &aTime),
+	}
+	for _, part := range parts {
+		if _, err := database.SaveSMSMessage(ctx, part); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, err := database.ListSMSMessages(ctx, SMSFilter{DeviceID: "modem"})
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("groups = %#v, %v", messages, err)
+	}
+	for _, message := range messages {
+		if (message.Body != "A1A2" && message.Body != "B1B2") || !ConcatSMSReadyToNotify(message.MessageID, message.Extra) {
+			t.Fatalf("crossed or incomplete message: %q", message.Body)
+		}
+	}
+}
+
+func TestModemSMSLegacyUncertaintyRespectsSubscription(t *testing.T) {
+	for _, test := range []struct {
+		name, iccid, imsi string
+		unknownLegacy     bool
+		isolated          bool
+	}{
+		{"different ICCID", "iccid-2", "imsi-1", false, false},
+		{"different IMSI", "iccid-1", "imsi-2", false, false},
+		{"same subscription", "iccid-1", "imsi-1", false, true},
+		{"unknown current subscription", "", "", false, true},
+		{"unknown legacy subscription", "iccid-2", "imsi-2", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := Open(ctx, ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			for index, body := range []string{"first ", "old second"} {
+				part := modemTestPart(t, index+1, body, "old")
+				if test.unknownLegacy {
+					part.ICCID, part.IMSI = "", ""
+				}
+				document, _ := decodeJSONObject(part.Extra)
+				delete(document, "at_concat")
+				part.Extra, _ = json.Marshal(document)
+				if _, err := database.SaveSMSMessage(ctx, part); err != nil {
+					t.Fatal(err)
+				}
+			}
+			later := time.Unix(1_700_000_001, 0).UTC()
+			first := modemTestPart(t, 1, "first ", "new-first", &later)
+			first.ICCID, first.IMSI = test.iccid, test.imsi
+			stored, err := database.SaveSMSMessage(ctx, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var extra modemSMSExtra
+			if err := json.Unmarshal(stored.Extra, &extra); err != nil || extra.AT == nil || extra.AT.Isolated != test.isolated {
+				t.Fatalf("new subscription isolated=%v: %#v, %v", test.isolated, stored, err)
+			}
+			second := modemTestPart(t, 2, "new second", "new-second", &later)
+			second.ICCID, second.IMSI = test.iccid, test.imsi
+			finished, err := database.SaveSMSMessage(ctx, second)
+			if err != nil || ConcatSMSReadyToNotify(finished.MessageID, finished.Extra) == test.isolated {
+				t.Fatalf("new subscription completion = %#v, %v", finished, err)
+			}
+			if !test.isolated && (finished.MessageID != stored.MessageID || finished.Body != "first new second") {
+				t.Fatalf("new SIM's segments did not join: %#v", finished)
+			}
+		})
+	}
+}
+
 func TestModemSMSGroupScopeAndExpiry(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		alias   bool
-		newSIM  bool
-		newDCS  bool
-		expired bool
-		joins   bool
+		name          string
+		alias         bool
+		newSIM        bool
+		newDCS        bool
+		expired       bool
+		differentTime bool
+		missingTime   bool
+		joins         bool
 	}{
 		{name: "compatible", joins: true},
 		{name: "direction alias", alias: true, joins: true},
 		{name: "different subscription", newSIM: true},
 		{name: "different coding", newDCS: true},
 		{name: "expired group", expired: true},
+		{name: "different SCTS", differentTime: true},
+		{name: "missing SCTS", missingTime: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -72,13 +162,19 @@ func TestModemSMSGroupScopeAndExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Known PDU rescans retain the original subscription and deadline.
-			first.IMSI, first.CreatedAt = "another-active-sim", time.Now().UTC()
+			first.ICCID, first.IMSI, first.CreatedAt = "another-active-card", "another-active-sim", time.Now().UTC()
 			replayed, err := database.SaveSMSMessageWithResult(ctx, first)
 			if err != nil || replayed.Inserted || replayed.Message.ID != stored.ID ||
-				replayed.Message.IMSI != stored.IMSI || !replayed.Message.CreatedAt.Equal(stored.CreatedAt) {
+				replayed.Message.ICCID != stored.ICCID || replayed.Message.IMSI != stored.IMSI || !replayed.Message.CreatedAt.Equal(stored.CreatedAt) {
 				t.Fatalf("replayed segment = %#v, %v", replayed, err)
 			}
 			second := modemTestPart(t, 2, "second", "second-pdu")
+			if test.differentTime {
+				later := second.Timestamp.Add(time.Second)
+				second = modemTestPart(t, 2, "second", "second-pdu", &later)
+			} else if test.missingTime {
+				second = modemTestPart(t, 2, "second", "second-pdu", nil)
+			}
 			if test.newSIM {
 				second.ICCID, second.IMSI = "iccid-2", "imsi-2"
 			}
@@ -220,13 +316,14 @@ func TestModemSMSLegacyAssociationKeepsDurableID(t *testing.T) {
 			if ModemSMSMatches(first.Message, parts[0]) {
 				t.Fatal("PDU matched a different modem")
 			}
-			// Once the old hash is known, equal text without SCTS is not enough
-			// to quarantine a provably different PDU from a new generation.
-			next, err := database.SaveSMSMessage(ctx, modemTestPart(t, 1, "first ", "new-first-pdu", nil))
+			// Once the old hash is known, equal text at a new SCTS does not
+			// quarantine different PDUs from a new generation.
+			nextTime := parts[1].Timestamp.Add(time.Second)
+			next, err := database.SaveSMSMessage(ctx, modemTestPart(t, 1, "first ", "new-first-pdu", &nextTime))
 			if err != nil || next.MessageID == legacy.MessageID {
 				t.Fatalf("new generation = %#v, %v", next, err)
 			}
-			finished, err := database.SaveSMSMessage(ctx, modemTestPart(t, 2, "new second", "new-second-pdu"))
+			finished, err := database.SaveSMSMessage(ctx, modemTestPart(t, 2, "new second", "new-second-pdu", &nextTime))
 			if err != nil || finished.MessageID != next.MessageID || !ConcatSMSReadyToNotify(finished.MessageID, finished.Extra) {
 				t.Fatalf("new generation did not complete: %#v, %v", finished, err)
 			}

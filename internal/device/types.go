@@ -198,8 +198,9 @@ func (usage SMSStorageUsage) Known() bool {
 }
 
 type SMSListing struct {
-	Messages []SMSMessage
-	Storage  SMSStorageUsage
+	Messages   []SMSMessage
+	Storage    SMSStorageUsage
+	Incomplete bool // At least one storage could not be enumerated.
 }
 
 type SMSStorageStatus string

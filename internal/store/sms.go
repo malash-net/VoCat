@@ -78,11 +78,7 @@ func (s *Store) signalSMSNotification() {
 	s.smsNotifications = make(chan struct{})
 }
 
-func saveSMSMessage(
-	ctx context.Context,
-	executor contextQueryExecer,
-	value SMSMessage,
-) (SMSMessage, error) {
+func normalizeSMSMessageIdentity(value *SMSMessage) {
 	value.DeviceID = strings.TrimSpace(value.DeviceID)
 	value.ModemIMEI = strings.TrimSpace(value.ModemIMEI)
 	value.ICCID = strings.TrimSpace(value.ICCID)
@@ -90,6 +86,14 @@ func saveSMSMessage(
 	value.LocalPhone = strings.TrimSpace(value.LocalPhone)
 	value.Peer = strings.TrimSpace(value.Peer)
 	value.Direction = strings.ToLower(strings.TrimSpace(value.Direction))
+}
+
+func saveSMSMessage(
+	ctx context.Context,
+	executor contextQueryExecer,
+	value SMSMessage,
+) (SMSMessage, error) {
+	normalizeSMSMessageIdentity(&value)
 	if value.DeviceID == "" {
 		return SMSMessage{}, errors.New("SMS device id is required")
 	}
@@ -350,6 +354,9 @@ func saveSMSMessage(
 }
 
 func (s *Store) SaveSMSMessages(ctx context.Context, values []SMSMessage) error {
+	if err := s.PrepareModemSMSBatch(ctx, values); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin SMS batch: %w", err)

@@ -304,7 +304,7 @@ func TestManagerListReadAndDeleteSMS(t *testing.T) {
 		t.Fatalf("ListSMS: %v", err)
 	}
 	messages := listing.Messages
-	if listing.Storage.SM != (SMSStorageArea{Used: 2, Total: 40}) ||
+	if listing.Incomplete || listing.Storage.SM != (SMSStorageArea{Used: 2, Total: 40}) ||
 		listing.Storage.ME != (SMSStorageArea{Used: 0, Total: 23}) {
 		t.Fatalf("storage = %#v", listing.Storage)
 	}
@@ -333,6 +333,56 @@ func TestManagerListReadAndDeleteSMS(t *testing.T) {
 		t.Fatalf("DeleteSMS: %v", err)
 	}
 	client.assertDone(t)
+}
+
+func TestManagerListSMSIncomplete(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		failedStorage string
+		failedCommand string
+	}{
+		{"SM select", "SM", "CPMS"},
+		{"ME select", "ME", "CPMS"},
+		{"SM list", "SM", "CMGL"},
+		{"ME list", "ME", "CMGL"},
+		{"both lists", "", "CMGL"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := errors.New("storage unavailable")
+			client := &transcriptClient{steps: []clientStep{{command: "AT+CMGF=0", response: okResponse()}}}
+			for _, storage := range []string{"SM", "ME"} {
+				failed := test.failedStorage == "" || storage == test.failedStorage
+				selectStep := clientStep{command: fmt.Sprintf("AT+CPMS=%q", storage), response: okResponse("+CPMS: 1,40,0,23,1,40")}
+				if failed && test.failedCommand == "CPMS" {
+					selectStep.err = failure
+				}
+				client.steps = append(client.steps, selectStep)
+				if selectStep.err != nil {
+					continue
+				}
+				listStep := clientStep{command: "AT+CMGL=4", response: okResponse("+CMGL: 7,0,,23", "000405912143F500004210203040500005C82293F904")}
+				if failed && test.failedCommand == "CMGL" {
+					listStep.err = failure
+				}
+				client.steps = append(client.steps, listStep)
+			}
+			wantMessages := 0
+			if test.failedStorage != "" {
+				wantMessages = 1
+				client.steps = append(client.steps, clientStep{command: `AT+CPMS="SM"`, response: okResponse()})
+			}
+			manager, id := newStartedTestManager(t, client)
+			listing, err := manager.ListSMS(context.Background(), id)
+			if !listing.Incomplete || len(listing.Messages) != wantMessages ||
+				(wantMessages == 0 && !errors.Is(err, failure)) || (wantMessages != 0 && err != nil) {
+				t.Fatalf("ListSMS = %#v, %v", listing, err)
+			}
+			if wantMessages != 0 && (listing.Messages[0].Storage == test.failedStorage || listing.Messages[0].Text != "HELLO") {
+				t.Fatalf("readable message lost: %#v", listing.Messages)
+			}
+			client.assertDone(t)
+		})
+	}
 }
 
 func TestManagerDeleteSMSFromStorageSelectsStorageAtomically(t *testing.T) {

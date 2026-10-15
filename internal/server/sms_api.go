@@ -721,9 +721,32 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			snapshotString(currentEntry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }),
 			config.ModemIMEI,
 		)
+		records := make([]store.SMSMessage, len(messages))
+		for index, message := range messages {
+			if message.Direction == device.SMSDirectionStatusReport && message.MessageReference != nil && message.StatusCode != nil {
+				continue
+			}
+			peer := firstNonEmpty(message.From, message.To)
+			if peer == "" {
+				continue
+			}
+			record, recordErr := modemSMSRecord(message)
+			if recordErr != nil {
+				s.logger.Warn("prepare modem SMS metadata failed", "device_id", config.ID, "error", recordErr)
+				continue
+			}
+			record.MessageID = modemSMSMessageID(message, modemIMEI, config.ID, peer)
+			record.DeviceID, record.ModemIMEI = config.ID, modemIMEI
+			record.ICCID, record.IMSI, record.LocalPhone = identityAfter.ICCID, identityAfter.IMSI, localPhone
+			records[index] = record
+		}
+		if err := s.store.PrepareModemSMSBatch(ctx, records); err != nil {
+			s.logger.Warn("prepare modem SMS batch failed", "device_id", config.ID, "error", err)
+			continue
+		}
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
-		for _, message := range messages {
+		for index, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
 				_, applyErr := s.store.ApplySMSDeliveryReport(ctx, store.SMSDeliveryReport{
@@ -750,18 +773,10 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				}
 				continue
 			}
-			peer := firstNonEmpty(message.From, message.To)
-			if peer == "" {
+			record := records[index]
+			if record.Source == "" {
 				continue
 			}
-			record, recordErr := modemSMSRecord(message)
-			if recordErr != nil {
-				s.logger.Warn("prepare modem SMS metadata failed", "device_id", config.ID, "error", recordErr)
-				continue
-			}
-			record.MessageID = modemSMSMessageID(message, modemIMEI, config.ID, peer, "")
-			record.DeviceID, record.ModemIMEI = config.ID, modemIMEI
-			record.ICCID, record.IMSI, record.LocalPhone = identityAfter.ICCID, identityAfter.IMSI, localPhone
 			saveResult, saveErr := s.store.SaveSMSMessageWithResult(ctx, record)
 			if saveErr != nil {
 				s.logger.Warn("persist modem SMS failed", "category", "sms", "device_id", config.ID, "raw_error", saveErr)
@@ -836,24 +851,14 @@ func (s *Server) clearPersistedModemSMS(ctx context.Context, physicalID, configI
 	}
 }
 
-func modemSMSMessageID(message device.SMSMessage, modemIMEI, deviceID, peer, concatSource string) string {
-	digest := sha256.Sum256([]byte(message.RawPDU))
-	messageID := fmt.Sprintf(
-		"modem:%s:%d:%s",
-		message.Storage,
-		message.Index,
-		hex.EncodeToString(digest[:8]),
-	)
+func modemSMSMessageID(message device.SMSMessage, modemIMEI, deviceID, peer string) string {
 	if message.Concat != nil && message.Concat.Total > 1 {
-		// This is only a legacy lookup hint. Store resolves persistent AT
-		// generations from segment evidence, never from storage-slot ordering.
-		source := firstNonEmpty(concatSource, "cellular_at")
-		messageID = store.StableConcatMessageID(
-			source, modemIMEI, deviceID, peer,
-			message.Concat.Reference, message.Concat.Total,
-		)
+		// This marks a multipart input; Store assigns its persistent generation
+		// using delivery evidence rather than physical storage coordinates.
+		return store.StableConcatMessageID("cellular_at", modemIMEI, deviceID, peer, message.Concat.Reference, message.Concat.Total)
 	}
-	return messageID
+	digest := sha256.Sum256([]byte(message.RawPDU))
+	return fmt.Sprintf("modem:%s:%d:%s", message.Storage, message.Index, hex.EncodeToString(digest[:8]))
 }
 
 type smsSubscriptionIdentity struct {
@@ -896,54 +901,6 @@ func (s *Server) smsLocalPhone(
 		return strings.TrimSpace(snapshot.Phone.Number)
 	}
 	return ""
-}
-
-// legacyModemSMSConcatSources reproduces old slot-derived IDs only as migration
-// hints. The store verifies legacy content and delivery evidence before reuse;
-// new messages are grouped by persistent metadata, not by these slot hints.
-func legacyModemSMSConcatSources(messages []device.SMSMessage) map[string]string {
-	firstSlots := make(map[string][]int)
-	for _, message := range messages {
-		if message.Concat == nil || message.Concat.Total <= 1 || message.Concat.Sequence != 1 {
-			continue
-		}
-		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" {
-			continue
-		}
-		key := modemSMSConcatKey(message, peer)
-		firstSlots[key] = append(firstSlots[key], message.Index)
-	}
-	for key := range firstSlots {
-		sort.Ints(firstSlots[key])
-	}
-
-	result := make(map[string]string)
-	for _, message := range messages {
-		if message.Concat == nil || message.Concat.Total <= 1 {
-			continue
-		}
-		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" {
-			continue
-		}
-		source := ""
-		for _, firstSlot := range firstSlots[modemSMSConcatKey(message, peer)] {
-			if firstSlot > message.Index {
-				break
-			}
-			source = fmt.Sprintf("cellular_at:%d", firstSlot)
-		}
-		if source == "" {
-			source = fmt.Sprintf("cellular_at:pending:%d", message.Index)
-		}
-		result[modemSMSStorageKey(message)] = source
-	}
-	return result
-}
-
-func modemSMSConcatKey(message device.SMSMessage, peer string) string {
-	return peer + ":" + strconv.Itoa(message.Concat.Reference) + ":" + strconv.Itoa(message.Concat.Total)
 }
 
 func modemSMSStorageKey(message device.SMSMessage) string {
@@ -1010,29 +967,46 @@ func (s *Server) deleteModemSMS(ctx context.Context, stored store.SMSMessage) er
 	}
 	s.rememberSMSStorage(config.ID, listing.Storage)
 	modemMessages := listing.Messages
-	concatSources := legacyModemSMSConcatSources(modemMessages)
+	multipart := strings.HasPrefix(stored.MessageID, store.ConcatMessageIDPrefix)
+	var observed []store.SMSMessage
+	if multipart {
+		if listing.Incomplete {
+			return errors.New("cannot confirm multipart SMS deletion: modem storage listing is incomplete")
+		}
+		observed = make([]store.SMSMessage, len(modemMessages))
+		identity := smsIdentityFromSnapshot(entry.Snapshot)
+		modemIMEI := firstNonEmpty(snapshotString(entry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }), config.ModemIMEI)
+		for index, message := range modemMessages {
+			if message.DecodeError != "" {
+				return errors.New("cannot confirm multipart SMS deletion: modem listing contains undecoded messages")
+			}
+			if firstNonEmpty(message.From, message.To) == "" {
+				continue
+			}
+			record, recordErr := modemSMSRecord(message)
+			if recordErr != nil {
+				return fmt.Errorf("prepare modem SMS before deletion: %w", recordErr)
+			}
+			record.DeviceID, record.ModemIMEI = config.ID, modemIMEI
+			record.ICCID, record.IMSI = identity.ICCID, identity.IMSI
+			observed[index] = record
+		}
+		stored, err = s.store.PrepareModemSMSDeletion(ctx, stored, observed)
+		if err != nil {
+			return err
+		}
+	}
 	locations := make(map[string]device.SMSMessage)
-	for _, message := range modemMessages {
+	for index, message := range modemMessages {
 		peer := firstNonEmpty(message.From, message.To)
 		if peer == "" {
 			continue
 		}
-		legacyID := modemSMSMessageID(message, stored.ModemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
-		matches := legacyID == stored.MessageID
-		if strings.HasPrefix(stored.MessageID, store.ConcatMessageIDPrefix) {
-			if peer != stored.Peer {
-				continue
-			}
-			observed, recordErr := modemSMSRecord(message)
-			if recordErr != nil {
-				return fmt.Errorf("prepare modem SMS before deletion: %w", recordErr)
-			}
-			identity := smsIdentityFromSnapshot(entry.Snapshot)
-			observed.MessageID = legacyID
-			observed.DeviceID = config.ID
-			observed.ModemIMEI = firstNonEmpty(snapshotString(entry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }), config.ModemIMEI)
-			observed.ICCID, observed.IMSI = identity.ICCID, identity.IMSI
-			matches = store.ModemSMSMatches(stored, observed)
+		matches := false
+		if multipart {
+			matches = store.ModemSMSMatches(stored, observed[index])
+		} else {
+			matches = modemSMSMessageID(message, stored.ModemIMEI, config.ID, peer) == stored.MessageID
 		}
 		if matches {
 			locations[modemSMSStorageKey(message)] = message
