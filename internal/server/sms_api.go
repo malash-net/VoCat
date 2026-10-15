@@ -724,6 +724,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
+		clearGroups := make(map[string]*modemSMSCleanupGroup)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -766,6 +767,15 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				direction = "outbound"
 			}
 			messageID := modemSMSMessageID(message, modemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
+			var clearGroup *modemSMSCleanupGroup
+			if autoClear {
+				clearGroup = clearGroups[messageID]
+				if clearGroup == nil {
+					clearGroup = &modemSMSCleanupGroup{}
+					clearGroups[messageID] = clearGroup
+				}
+				clearGroup.messages = append(clearGroup.messages, message)
+			}
 			extra, _ := json.Marshal(map[string]any{
 				"modem_index":        message.Index,
 				"storage":            message.Storage,
@@ -802,14 +812,18 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				Extra:         extra,
 			})
 			if saveErr != nil {
+				if clearGroup != nil {
+					clearGroup.failed = true
+				}
 				s.logger.Warn("persist modem SMS failed", "category", "sms", "device_id", config.ID, "raw_error", saveErr)
 				continue
 			}
-			if autoClear {
-				clearSlots = appendModemSMSSlot(clearSlots, message)
+			saved := saveResult.Message
+			ready := store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra)
+			if clearGroup != nil {
+				clearGroup.ready = ready
 			}
-			if saved := saveResult.Message; saveResult.Inserted && saved.Direction == "inbound" &&
-				store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra) {
+			if saveResult.Inserted && saved.Direction == "inbound" && ready {
 				s.logger.Info("cellular SMS received",
 					"category", "sms", "event", "sms.received",
 					"device_id", config.ID, "peer", saved.Peer,
@@ -819,9 +833,25 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			}
 		}
 		if autoClear {
+			// Retain the first slot until the whole group is durable, so later
+			// scans keep the same concat identity for segments arriving separately.
+			for _, group := range clearGroups {
+				if !group.ready || group.failed {
+					continue
+				}
+				for _, message := range group.messages {
+					clearSlots = appendModemSMSSlot(clearSlots, message)
+				}
+			}
 			s.clearPersistedModemSMS(ctx, physicalID, config.ID, clearSlots)
 		}
 	}
+}
+
+type modemSMSCleanupGroup struct {
+	messages []device.SMSMessage
+	ready    bool
+	failed   bool
 }
 
 type modemSMSSlot struct {

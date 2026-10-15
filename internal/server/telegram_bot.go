@@ -2272,20 +2272,8 @@ func (bot *telegramBot) sendSMSNotification(ctx context.Context, config telegram
 }
 
 func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
-	cursorInitialized := false
-	var cursor int64
+	cursor := bot.server.store.StartupSMSMessageID()
 	for ctx.Err() == nil {
-		if !cursorInitialized {
-			latest, err := bot.server.store.LatestSMSMessageID(ctx)
-			if err != nil {
-				bot.warn("initialize Telegram SMS cursor", err)
-				if !waitTelegram(ctx, telegramNotificationPeriod) {
-					return
-				}
-				continue
-			}
-			cursor, cursorInitialized = latest, true
-		}
 		wake := bot.server.store.SMSNotifications()
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {

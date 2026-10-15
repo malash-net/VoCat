@@ -149,12 +149,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 	send smsNotificationSender,
 ) (time.Duration, bool) {
 	if !state.initialized {
-		latest, err := s.store.LatestSMSMessageID(ctx)
-		if err != nil {
-			state.logError(s, channel, err)
-			return smsNotificationPollInterval, true
-		}
-		state.id, state.initialized = latest, true
+		state.id, state.initialized = s.store.StartupSMSMessageID(), true
 		state.lastError = ""
 	}
 	retry := false

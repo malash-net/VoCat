@@ -27,6 +27,7 @@ type Store struct {
 
 	smsNotificationsMu sync.Mutex
 	smsNotifications   chan struct{}
+	startupSMSID       int64
 }
 
 type Admin struct {
@@ -84,7 +85,18 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return closeOnError(fmt.Errorf("secure sqlite file: %w", err))
 		}
 	}
-	return &Store{db: db, smsNotifications: make(chan struct{})}, nil
+	s := &Store{db: db, smsNotifications: make(chan struct{})}
+	s.startupSMSID, err = s.LatestSMSMessageID(ctx)
+	if err != nil {
+		return closeOnError(fmt.Errorf("initialize SMS notification cursor: %w", err))
+	}
+	return s, nil
+}
+
+// StartupSMSMessageID is the immutable history boundary captured by Open,
+// before this process can save new deliveries. Each notifier owns its cursor.
+func (s *Store) StartupSMSMessageID() int64 {
+	return s.startupSMSID
 }
 
 func prepareDatabasePath(path string) error {

@@ -291,6 +291,68 @@ func TestSyncModemSMSLogsMultipartMessageOnlyOnceAcrossStoragesAndPolls(t *testi
 	}
 }
 
+func TestSyncModemSMSRetainsSegmentsUntilComplete(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const deviceID, imei = "ec20-1", "867394042309830"
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	part := func(index, sequence int, body string) device.SMSMessage {
+		return device.SMSMessage{
+			Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+			Direction: device.SMSDirectionReceived, From: "+447700900123", Text: body,
+			Concat: &device.SMSConcatInfo{Reference: 7, Total: 2, Sequence: sequence}, RawPDU: body,
+		}
+	}
+	controller := &smsDeletionController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{
+			ID: deviceID, Discovered: true,
+			Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
+		}},
+		storedMessages: []device.SMSMessage{part(20, 1, "first ")},
+	}
+	hub := loghub.New(slog.NewTextHandler(io.Discard, nil), 100)
+	server := &Server{store: database, logger: slog.New(hub), devices: controller}
+	server.syncModemSMS(ctx, deviceID)
+	partial, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(partial) != 1 || smsMessageReadyToNotify(partial[0]) {
+		t.Fatalf("first scan messages = %#v, %v", partial, err)
+	}
+	if len(controller.deleted) != 0 || len(controller.storedMessages) != 1 {
+		t.Fatalf("incomplete SMS was cleared: deleted=%v, remaining=%v", controller.deleted, controller.storedMessages)
+	}
+
+	// Only the new segment arrives; the first must still be on the modem.
+	controller.storedMessages = append(controller.storedMessages, part(25, 2, "second"))
+	server.syncModemSMS(ctx, deviceID)
+	complete, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(complete) != 1 || complete[0].MessageID != partial[0].MessageID ||
+		complete[0].Body != "first second" || !smsMessageReadyToNotify(complete[0]) {
+		t.Fatalf("second scan messages = %#v, %v", complete, err)
+	}
+	fresh, err := database.ListInboundSMSAfterID(ctx, partial[0].ID, 10)
+	if err != nil || len(fresh) != 1 || fresh[0].ID != complete[0].ID {
+		t.Fatalf("notification candidates = %#v, %v", fresh, err)
+	}
+	if strings.Join(controller.deleted, ",") != "SM:25,SM:20" || len(controller.storedMessages) != 0 {
+		t.Fatalf("completed SMS cleanup: deleted=%v, remaining=%v", controller.deleted, controller.storedMessages)
+	}
+	server.syncModemSMS(ctx, deviceID)
+	fresh, err = database.ListInboundSMSAfterID(ctx, complete[0].ID, 10)
+	if err != nil || len(fresh) != 0 || len(controller.deleted) != 2 ||
+		len(hub.History(100, slog.LevelInfo, "cellular SMS received")) != 1 {
+		t.Fatalf("repeated scan: messages=%#v, deleted=%v, error=%v", fresh, controller.deleted, err)
+	}
+}
+
 func TestSyncModemSMSSeparatesReusedConcatReferencesWithoutCursorChurn(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, ":memory:")
