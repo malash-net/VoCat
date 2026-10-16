@@ -1120,7 +1120,20 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// The periodic scan is the fallback for modems that never signal
+			// +CMTI. Logged so its cost and timing are distinguishable from the
+			// event-driven path.
+			started := time.Now()
+			if s.logger != nil {
+				s.logger.Debug("periodic modem SMS scan starting",
+					"category", "sms", "event", "sms.poll.start", "interval_ms", interval.Milliseconds())
+			}
 			s.syncModemSMS(ctx, "")
+			if s.logger != nil {
+				s.logger.Debug("periodic modem SMS scan finished",
+					"category", "sms", "event", "sms.poll.finish",
+					"duration_ms", time.Since(started).Milliseconds())
+			}
 		}
 	}
 }
