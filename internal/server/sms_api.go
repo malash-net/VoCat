@@ -674,11 +674,6 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				}
 			}
 			if deferSync {
-				if s.logger != nil {
-					s.logger.Debug("modem SMS scan deferred while VoWiFi owns the AT path",
-						"category", "sms", "event", "sms.arrival.deferred",
-						"device_id", config.ID, "phase", state.Phase, "error", stateErr)
-				}
 				continue
 			}
 		}
@@ -1120,20 +1115,7 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// The periodic scan is the fallback for modems that never signal
-			// +CMTI. Logged so its cost and timing are distinguishable from the
-			// event-driven path.
-			started := time.Now()
-			if s.logger != nil {
-				s.logger.Debug("periodic modem SMS scan starting",
-					"category", "sms", "event", "sms.poll.start", "interval_ms", interval.Milliseconds())
-			}
 			s.syncModemSMS(ctx, "")
-			if s.logger != nil {
-				s.logger.Debug("periodic modem SMS scan finished",
-					"category", "sms", "event", "sms.poll.finish",
-					"duration_ms", time.Since(started).Milliseconds())
-			}
 		}
 	}
 }
@@ -1168,7 +1150,6 @@ func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
 func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	source, ok := s.devices.(cellularSMSArrivalEventController)
 	if !ok {
-		s.logSMSArrivalDebug("device backend cannot report SMS arrival events; only the periodic scan runs")
 		return
 	}
 	events, err := source.SubscribeSMSArrivalEvents(ctx)
@@ -1180,11 +1161,7 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	}
 	// A nil channel would block this goroutine forever.
 	if events == nil {
-		s.logSMSArrivalDebug("device backend returned no SMS arrival channel; only the periodic scan runs")
 		return
-	}
-	if s.logger != nil {
-		s.logger.Info("modem SMS arrival reconciler started", "category", "sms", "event", "sms.arrival.reconciler_started")
 	}
 	// pending holds the devices seen since the last scan. The timer is reset on
 	// every indication so a burst collapses into one pass.
@@ -1212,10 +1189,6 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 				continue
 			}
 			pending[physicalID] = struct{}{}
-			if s.logger != nil {
-				s.logger.Debug("modem reported an inbound SMS indication",
-					"category", "sms", "event", "sms.arrival.indication", "physical_id", physicalID)
-			}
 			if timer == nil {
 				windowStart = time.Now()
 				timer = time.NewTimer(smsArrivalDebounce)
@@ -1239,12 +1212,6 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 
 // logSMSArrivalDebug reports a disabled arrival path. It matters because a
 // silent no-op here is indistinguishable from "the modem never signalled".
-func (s *Server) logSMSArrivalDebug(message string) {
-	if s.logger != nil {
-		s.logger.Info(message, "category", "sms", "event", "sms.arrival.unavailable")
-	}
-}
-
 // resetTimer restarts a timer, draining an already-delivered value so the
 // reset is not consumed by it.
 func resetTimer(timer *time.Timer, delay time.Duration) {
@@ -1279,31 +1246,12 @@ func (s *Server) syncModemSMSForPhysicalDevices(ctx context.Context, physicalIDs
 		}
 	}
 	if len(resolved) == 0 {
-		if s.logger != nil {
-			s.logger.Info("modem SMS indication matched no configured device; scanning every device",
-				"category", "sms", "event", "sms.arrival.unresolved", "physical_ids", physicalIDList(physicalIDs))
-		}
 		s.syncModemSMS(ctx, "")
 		return
 	}
 	for configID := range resolved {
-		if s.logger != nil {
-			s.logger.Info("scanning device after modem SMS indication",
-				"category", "sms", "event", "sms.arrival.scan", "device_id", configID)
-		}
 		s.syncModemSMS(ctx, configID)
 	}
-}
-
-// physicalIDList renders the pending physical IDs for a log line, sorted so the
-// output is stable.
-func physicalIDList(physicalIDs map[string]struct{}) []string {
-	values := make([]string, 0, len(physicalIDs))
-	for physicalID := range physicalIDs {
-		values = append(values, physicalID)
-	}
-	sort.Strings(values)
-	return values
 }
 
 func storedSMSResponse(message store.SMSMessage) map[string]any {

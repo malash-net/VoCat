@@ -2323,20 +2323,7 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 						cursor = message.ID
 						continue
 					}
-					started := time.Now()
-					sendErr := bot.sendSMSNotification(ctx, config, message)
-					if logger := bot.server.logger; logger != nil {
-						// age_ms is the end-to-end latency: store insert to the
-						// Telegram API call. Telegram has its own poll loop, so
-						// this is measured separately from the other channels.
-						logger.Info("Telegram SMS notification dispatched",
-							"category", "sms", "event", "sms.notification.dispatched",
-							"channel", "telegram", "device_id", message.DeviceID,
-							"age_ms", started.Sub(message.CreatedAt).Milliseconds(),
-							"send_ms", time.Since(started).Milliseconds(),
-							"error", sendErr)
-					}
-					if sendErr != nil {
+					if sendErr := bot.sendSMSNotification(ctx, config, message); sendErr != nil {
 						bot.warn("send Telegram SMS notification", sendErr)
 						break
 					}
