@@ -153,7 +153,7 @@ func (bot *telegramBot) poll(ctx context.Context) {
 			}
 			continue
 		}
-		if !enabled {
+		if !enabled || config.AdminID <= 0 {
 			activeToken = ""
 			offset = 0
 			if !waitTelegram(ctx, telegramPollInterval) {
