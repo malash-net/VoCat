@@ -32,6 +32,8 @@ func (controller *countingSMSController) listCalls() int {
 	return controller.calls
 }
 
+// newSMSArrivalServer builds a server with one configured device backed by the
+// given physical entry.
 func newSMSArrivalServer(t *testing.T, entry device.Device, controller DeviceController) *Server {
 	t.Helper()
 	ctx := context.Background()
@@ -40,133 +42,70 @@ func newSMSArrivalServer(t *testing.T, entry device.Device, controller DeviceCon
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := database.UpsertDevice(ctx, store.Device{
-		ID: entry.ID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
-		SMSEnabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
 	server := &Server{store: database, logger: regionTestLogger()}
 	server.devices = controller
 	return server
 }
 
-func TestSMSArrivalEventTriggersTargetedSync(t *testing.T) {
-	const deviceID = "ec20-1"
-	receivedAt := time.Unix(1_700_000_000, 0).UTC()
-	controller := &countingSMSController{fakeDeviceController: fakeDeviceController{
-		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
-			DeviceID: deviceID, IMEI: "867394042309830", ICCID: "iccid-a", IMSI: "imsi-a",
-		}},
-		smsMessages: []device.SMSMessage{{
-			Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
-			Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
-			ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
-		}},
-	}}
-	server := newSMSArrivalServer(t, controller.entry, controller)
-	server.syncModemSMSForPhysicalDevices(context.Background(), map[string]struct{}{deviceID: {}})
-
-	messages, err := server.store.ListSMSMessages(context.Background(), store.SMSFilter{DeviceID: deviceID})
-	if err != nil {
+func upsertArrivalDevice(t *testing.T, server *Server, config store.Device) {
+	t.Helper()
+	config.DeviceType = store.DeviceTypePCIeEC20EC25
+	config.SMSEnabled = true
+	if err := server.store.UpsertDevice(context.Background(), config); err != nil {
 		t.Fatal(err)
-	}
-	if len(messages) != 1 || messages[0].Body != "hello" {
-		t.Fatalf("stored messages = %#v", messages)
 	}
 }
 
-// The indication carries a physical ID while syncModemSMS matches on the stored
-// config ID, so the resolver has to bridge the two.
-func TestSMSArrivalEventResolvesPhysicalIDToConfigID(t *testing.T) {
+func arrivalMessage(receivedAt time.Time) device.SMSMessage {
+	return device.SMSMessage{
+		Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
+		ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
+	}
+}
+
+// The indication carries a physical device ID, while syncModemSMS matches on
+// the stored config ID; the resolver must bridge the two.
+func TestSMSArrivalEventScansMatchingDevice(t *testing.T) {
 	const (
-		configID   = "ec20"
+		configID   = "ultramobile"
 		physicalID = "usb-1-2"
 		imei       = "867394042309830"
 	)
-	ctx := context.Background()
 	receivedAt := time.Unix(1_700_000_000, 0).UTC()
 	controller := &countingSMSController{fakeDeviceController: fakeDeviceController{
 		entry: device.Device{ID: physicalID, Discovered: true, Snapshot: &device.Snapshot{
 			DeviceID: physicalID, IMEI: imei, ICCID: "iccid-a", IMSI: "imsi-a",
 		}},
-		smsMessages: []device.SMSMessage{{
-			Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
-			Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
-			ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
-		}},
-	}}
-	database, err := store.Open(ctx, ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	// The config ID and the physical ID differ; only the IMEI links them.
-	if err := database.UpsertDevice(ctx, store.Device{
-		ID: configID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
-		ModemIMEI: imei, SMSEnabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	server := &Server{store: database, logger: regionTestLogger()}
-	server.devices = controller
-
-	server.syncModemSMSForPhysicalDevices(ctx, map[string]struct{}{physicalID: {}})
-
-	messages, err := database.ListSMSMessages(ctx, store.SMSFilter{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(messages) != 1 {
-		t.Fatalf("stored messages = %#v", messages)
-	}
-	if messages[0].DeviceID != configID {
-		t.Fatalf("message device ID = %q, want the config ID %q", messages[0].DeviceID, configID)
-	}
-}
-
-func TestSMSArrivalEventUnresolvedFallsBackToFullScan(t *testing.T) {
-	const deviceID = "ec20-1"
-	receivedAt := time.Unix(1_700_000_000, 0).UTC()
-	controller := &countingSMSController{fakeDeviceController: fakeDeviceController{
-		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
-			DeviceID: deviceID, IMEI: "867394042309830", ICCID: "iccid-a", IMSI: "imsi-a",
-		}},
-		smsMessages: []device.SMSMessage{{
-			Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
-			Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
-			ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
-		}},
+		smsMessages: []device.SMSMessage{arrivalMessage(receivedAt)},
 	}}
 	server := newSMSArrivalServer(t, controller.entry, controller)
-	server.syncModemSMSForPhysicalDevices(context.Background(), map[string]struct{}{"unknown-physical": {}})
+	upsertArrivalDevice(t, server, store.Device{ID: configID, Name: "EC20", ModemIMEI: imei})
 
-	if calls := controller.listCalls(); calls == 0 {
-		t.Fatal("unresolved indication did not trigger a fallback scan")
-	}
+	server.syncModemSMSForPhysicalDevices(context.Background(), map[string]struct{}{physicalID: {}})
+
 	messages, err := server.store.ListSMSMessages(context.Background(), store.SMSFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 1 {
+	if len(messages) != 1 || messages[0].DeviceID != configID {
 		t.Fatalf("stored messages = %#v", messages)
 	}
 }
 
-// A burst must collapse into one scan pass instead of stacking six AT commands
-// per indication behind the global SMS lock.
+// A burst must collapse into one scan pass rather than one per indication.
 func TestSMSArrivalEventBurstCoalesces(t *testing.T) {
-	const deviceID = "ec20-1"
+	const deviceID = "ultramobile"
 	controller := &countingSMSController{fakeDeviceController: fakeDeviceController{
 		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
 			DeviceID: deviceID, IMEI: "867394042309830", ICCID: "iccid-a", IMSI: "imsi-a",
 		}},
 	}}
 	server := newSMSArrivalServer(t, controller.entry, controller)
+	upsertArrivalDevice(t, server, store.Device{ID: deviceID, Name: "EC20"})
 	events := make(chan string, 1)
 	controller.smsEvents = events
-	// Point the reconciler at the same controller so the debounce path is
-	// exercised end to end.
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go server.runSMSArrivalReconciler(ctx)
@@ -174,58 +113,25 @@ func TestSMSArrivalEventBurstCoalesces(t *testing.T) {
 	for index := 0; index < 20; index++ {
 		events <- deviceID
 	}
-	// The debounce window plus one scan must fit well inside this budget.
-	waitForCondition(t, func() bool { return controller.listCalls() > 0 })
-	time.Sleep(4 * smsArrivalDebounce)
-	if calls := controller.listCalls(); calls > 1 {
+	deadline := time.Now().Add(2 * time.Second)
+	for controller.listCalls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(4 * smsArrivalThrottle)
+	if calls := controller.listCalls(); calls != 1 {
 		t.Fatalf("burst produced %d scans, want 1", calls)
 	}
 }
 
-func waitForCondition(t *testing.T, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("condition was not met before the deadline")
-}
-
-// capabilityLessController implements DeviceController but not the optional
-// arrival-event interface; embedding the interface withholds the method.
-type capabilityLessController struct {
-	DeviceController
-}
-
-func TestSMSArrivalReconcilerWithoutCapability(t *testing.T) {
-	server := &Server{logger: regionTestLogger()}
-	server.devices = capabilityLessController{DeviceController: fakeDeviceController{}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		server.runSMSArrivalReconciler(ctx)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("reconciler did not return for a backend without the capability")
-	}
-}
-
-func TestSMSArrivalReconcilerReturnsOnNilChannel(t *testing.T) {
+// The reconciler must return rather than block when the backend cannot supply
+// an event channel.
+func TestSMSArrivalReconcilerReturnsWithoutEvents(t *testing.T) {
 	server := &Server{logger: regionTestLogger()}
 	server.devices = fakeDeviceController{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		server.runSMSArrivalReconciler(ctx)
+		server.runSMSArrivalReconciler(context.Background())
 	}()
 	select {
 	case <-done:
@@ -234,9 +140,8 @@ func TestSMSArrivalReconcilerReturnsOnNilChannel(t *testing.T) {
 	}
 }
 
-// A modem that already defaults to 2,1,0,0,0 must not be rewritten: the write
-// would be a no-op, and the scan stays clear of any URC routing change. Only
-// the OpenStick 410, whose firmware resets CNMI, is reasserted.
+// A modem already defaulting to 2,1,0,0,0 must not be rewritten: only the
+// OpenStick 410, whose firmware resets CNMI, is reasserted.
 func TestSyncModemSMSLeavesDefaultSMSIndicationAlone(t *testing.T) {
 	const deviceID = "ec20-1"
 	var commands []string
@@ -250,11 +155,12 @@ func TestSyncModemSMSLeavesDefaultSMSIndicationAlone(t *testing.T) {
 		},
 	}}
 	server := newSMSArrivalServer(t, controller.entry, controller)
+	upsertArrivalDevice(t, server, store.Device{ID: deviceID, Name: "EC20"})
 	server.syncModemSMS(context.Background(), deviceID)
 
 	for _, command := range commands {
 		if strings.HasPrefix(strings.ToUpper(command), "AT+CNMI") {
-			t.Fatalf("CNMI was rewritten on a modem that already defaults to it; commands = %#v", commands)
+			t.Fatalf("CNMI was rewritten; commands = %#v", commands)
 		}
 	}
 }

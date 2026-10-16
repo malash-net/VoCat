@@ -288,12 +288,9 @@ func (session *Session) readLoop() {
 
 // SetSMSArrivalHandler registers a callback invoked when the raw byte stream
 // carries a new-SMS indication. An idle session never parses URCs, so without
-// this an idle modem's +CMTI stays unnoticed until the next periodic scan.
-// The handler runs on the read goroutine and must return promptly.
+// this a modem's +CMTI waits for the next periodic scan. The handler runs on
+// the read goroutine and must not block.
 func (session *Session) SetSMSArrivalHandler(handler func()) {
-	if session == nil {
-		return
-	}
 	if handler == nil {
 		session.smsArrivalHandler.Store(nil)
 		return
@@ -301,50 +298,25 @@ func (session *Session) SetSMSArrivalHandler(handler func()) {
 	session.smsArrivalHandler.Store(&handler)
 }
 
-// sniffSMSArrival scans one raw read for a new-SMS indication. It never touches
-// the gate, pending transaction, or read buffer, so it cannot disturb AT
-// response framing; a false positive only costs an idempotent rescan.
+// sniffSMSArrival scans one raw read for a new-SMS indication. It touches
+// neither the gate, the pending transaction, nor the read buffer, so it cannot
+// disturb AT response framing; a false positive only costs an idempotent
+// rescan.
 func (session *Session) sniffSMSArrival(data []byte) {
 	handler := session.smsArrivalHandler.Load()
-	if handler == nil || len(data) == 0 {
+	if handler == nil {
 		return
 	}
 	scanned := data
 	if len(session.smsScanTail) > 0 {
 		scanned = append(append([]byte(nil), session.smsScanTail...), data...)
 	}
-	if containsSMSArrivalIndication(scanned) {
+	if bytes.Contains(bytes.ToLower(scanned), smsIndicationNeedle) {
 		(*handler)()
 	}
-	// Keep a tail shorter than the prefix so a split match can complete.
-	tail := len(newSMSIndicationPrefix) - 1
-	if len(data) < tail {
-		tail = len(data)
-	}
+	// Keep a tail shorter than the indication so a split match can complete.
+	tail := min(len(data), len(smsIndicationNeedle)-1)
 	session.smsScanTail = append(session.smsScanTail[:0], data[len(data)-tail:]...)
-}
-
-// containsSMSArrivalIndication reports whether the stream carries the new-SMS
-// indication. The prefix must start a line so a query response or command echo
-// cannot be mistaken for one.
-func containsSMSArrivalIndication(data []byte) bool {
-	needle := []byte(strings.ToLower(newSMSIndicationPrefix))
-	lower := bytes.ToLower(data)
-	for offset := 0; ; {
-		index := bytes.Index(lower[offset:], needle)
-		if index < 0 {
-			return false
-		}
-		index += offset
-		if index == 0 || isLineBoundary(lower[index-1]) {
-			return true
-		}
-		offset = index + 1
-	}
-}
-
-func isLineBoundary(value byte) bool {
-	return value == '\r' || value == '\n'
 }
 
 func (session *Session) receivePendingLocked() {
@@ -662,9 +634,9 @@ func isFinalResult(line string) bool {
 		strings.HasPrefix(upper, "+CMS ERROR:")
 }
 
-// newSMSIndicationPrefix is the indication a modem emits after AT+CNMI=2,1.
-// Shared by the URC classifier and the raw-stream sniffer.
-const newSMSIndicationPrefix = "+CMTI:"
+// smsIndicationNeedle is the new-SMS indication a modem emits after
+// AT+CNMI=2,1, lower-cased to match a lower-cased read.
+var smsIndicationNeedle = []byte("+cmti:")
 
 func isURC(line string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(line))
@@ -676,7 +648,7 @@ func isURC(line string) bool {
 		return true
 	}
 	for _, prefix := range []string{
-		newSMSIndicationPrefix,
+		"+CMTI:",
 		"+CMT:",
 		"+CDS:",
 		"+CREG:",

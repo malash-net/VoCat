@@ -163,8 +163,8 @@ func (manager *Manager) publishNetworkStatusEvent(deviceID string) {
 
 // SubscribeSMSArrivalEvents subscribes to modem-side new-SMS indications. The
 // channel carries the physical device ID and is only a wake-up signal: the
-// consumer scans modem storage to find the message, so a dropped or spurious
-// signal changes nothing but latency.
+// consumer scans modem storage, so a dropped or spurious signal costs latency
+// at most.
 func (manager *Manager) SubscribeSMSArrivalEvents(ctx context.Context) (<-chan string, error) {
 	if manager == nil {
 		return nil, ErrDataBackendUnavailable

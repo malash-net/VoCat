@@ -684,8 +684,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
 		// OpenStick 410 controls cellular registration through QMI but receives
 		// stored SMS through its AT port. Its firmware can reset CNMI after a
-		// profile switch, leaving newly delivered SMS invisible to VoCat. Other
-		// modems already default to this value, so only the 410 is reasserted.
+		// profile switch, leaving newly delivered SMS invisible to VoCat.
 		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
 			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
 			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
@@ -1120,21 +1119,13 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// smsArrivalDebounce groups the indications a burst produces — the segments of
-// one long message, or several messages landing together — into a single
-// storage scan, since each scan costs roughly six AT commands per device under
-// the global smsSyncMu.
-const smsArrivalDebounce = 300 * time.Millisecond
-
-// smsArrivalMaxWait caps how long the quiet period may be extended, so a modem
-// that signals continuously still gets scanned instead of starving behind its
-// own debounce.
-const smsArrivalMaxWait = 2 * time.Second
+// smsArrivalThrottle groups a burst of indications — the segments of one long
+// message, or several messages landing together — into a single storage scan.
+const smsArrivalThrottle = 300 * time.Millisecond
 
 // StartSMSArrivalReconciler persists inbound cellular SMS as soon as the modem
-// reports one, instead of waiting for the next periodic scan. The periodic
-// StartSMSSyncLoop remains the safety net for firmware that never signals and
-// for VoWiFi devices that arrive over IMS rather than AT.
+// reports one, instead of waiting for the next periodic scan. StartSMSSyncLoop
+// remains the safety net for firmware that never signals.
 func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
 	if s == nil {
 		return
@@ -1150,6 +1141,7 @@ func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
 func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	source, ok := s.devices.(cellularSMSArrivalEventController)
 	if !ok {
+		s.logSMSArrivalUnavailable("device backend cannot report modem SMS indications")
 		return
 	}
 	events, err := source.SubscribeSMSArrivalEvents(ctx)
@@ -1161,21 +1153,12 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	}
 	// A nil channel would block this goroutine forever.
 	if events == nil {
+		s.logSMSArrivalUnavailable("device backend returned no SMS arrival channel")
 		return
 	}
-	// pending holds the devices seen since the last scan. The timer is reset on
-	// every indication so a burst collapses into one pass.
+	// Indications arriving while the throttle runs accumulate into one scan.
 	pending := make(map[string]struct{})
-	var timer *time.Timer
-	var timerC <-chan time.Time
-	var windowStart time.Time
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer, timerC = nil, nil
-		}
-	}
-	defer stopTimer()
+	var throttle <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -1189,20 +1172,15 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 				continue
 			}
 			pending[physicalID] = struct{}{}
-			if timer == nil {
-				windowStart = time.Now()
-				timer = time.NewTimer(smsArrivalDebounce)
-				timerC = timer.C
-				continue
+			if s.logger != nil {
+				s.logger.Debug("modem reported an inbound SMS indication",
+					"category", "sms", "event", "sms.arrival.indication", "physical_id", physicalID)
 			}
-			// Clamped so the window cannot be extended past the hard deadline.
-			remaining := smsArrivalMaxWait - time.Since(windowStart)
-			if remaining <= smsArrivalDebounce {
-				continue
+			if throttle == nil {
+				throttle = time.After(smsArrivalThrottle)
 			}
-			resetTimer(timer, smsArrivalDebounce)
-		case <-timerC:
-			timer, timerC = nil, nil
+		case <-throttle:
+			throttle = nil
 			targets := pending
 			pending = make(map[string]struct{})
 			s.syncModemSMSForPhysicalDevices(ctx, targets)
@@ -1210,18 +1188,13 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	}
 }
 
-// logSMSArrivalDebug reports a disabled arrival path. It matters because a
-// silent no-op here is indistinguishable from "the modem never signalled".
-// resetTimer restarts a timer, draining an already-delivered value so the
-// reset is not consumed by it.
-func resetTimer(timer *time.Timer, delay time.Duration) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
+// logSMSArrivalUnavailable reports that inbound SMS falls back to the periodic
+// scan, so a silent absence of arrival logs is explainable.
+func (s *Server) logSMSArrivalUnavailable(message string) {
+	if s.logger != nil {
+		s.logger.Info(message+"; only the periodic scan runs",
+			"category", "sms", "event", "sms.arrival.unavailable")
 	}
-	timer.Reset(delay)
 }
 
 // syncModemSMSForPhysicalDevices scans the configured devices backing the given
@@ -1246,10 +1219,18 @@ func (s *Server) syncModemSMSForPhysicalDevices(ctx context.Context, physicalIDs
 		}
 	}
 	if len(resolved) == 0 {
+		if s.logger != nil {
+			s.logger.Debug("modem SMS indication matched no configured device; scanning every device",
+				"category", "sms", "event", "sms.arrival.unresolved")
+		}
 		s.syncModemSMS(ctx, "")
 		return
 	}
 	for configID := range resolved {
+		if s.logger != nil {
+			s.logger.Info("scanning device after modem SMS indication",
+				"category", "sms", "event", "sms.arrival.scan", "device_id", configID)
+		}
 		s.syncModemSMS(ctx, configID)
 	}
 }

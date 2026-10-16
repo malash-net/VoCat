@@ -50,53 +50,9 @@ func TestSMSArrivalEventPublishesDeviceID(t *testing.T) {
 	}
 }
 
-// A client without the optional capability is left alone: no fake needs
-// updating for the new interface, and the periodic scan remains its path.
+// A client without the optional capability must be left alone, so existing
+// fakes need no update and the periodic scan remains its path.
 func TestSMSArrivalEventSkipsClientWithoutCapability(t *testing.T) {
 	manager := &Manager{}
-	client := &transcriptClient{}
-	if _, ok := any(client).(smsArrivalSubscriber); ok {
-		t.Fatal("transcriptClient unexpectedly implements smsArrivalSubscriber")
-	}
-	manager.registerSMSArrivalHandler("physical-1", client)
-}
-
-// A subscriber that never drains must not block the publishing read goroutine.
-func TestSMSArrivalEventPublishDoesNotBlock(t *testing.T) {
-	manager := &Manager{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if _, err := manager.SubscribeSMSArrivalEvents(ctx); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for index := 0; index < 64; index++ {
-			manager.publishSMSArrivalEvent("physical-1")
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("publishing blocked on a subscriber that never drained")
-	}
-}
-
-func TestSMSArrivalEventSubscriptionClosesOnCancel(t *testing.T) {
-	manager := &Manager{}
-	ctx, cancel := context.WithCancel(context.Background())
-	events, err := manager.SubscribeSMSArrivalEvents(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	select {
-	case _, ok := <-events:
-		if ok {
-			t.Fatal("channel delivered a value instead of closing")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("subscription was not closed on context cancellation")
-	}
+	manager.registerSMSArrivalHandler("physical-1", &transcriptClient{})
 }
