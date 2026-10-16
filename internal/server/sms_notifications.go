@@ -145,48 +145,54 @@ func (state *smsNotificationCursor) logError(server *Server, channel string, err
 // retry policy can be tested without reaching a real provider.
 type smsNotificationSender func(context.Context, string, map[string]any, smsNotification) error
 
-// runSMSNotificationChannel polls one notification channel until ctx is
-// cancelled, sleeping for the delay returned by each scheduling tick so a
-// failing provider backs off instead of being retried every two seconds.
+// runSMSNotificationChannel wakes for new messages, retaining polling as a
+// fallback and waiting the full retry delay on errors.
 func (s *Server) runSMSNotificationChannel(ctx context.Context, channel string) {
 	state := &smsNotificationCursor{}
 	for ctx.Err() == nil {
-		delay := s.deliverSMSNotificationsOnce(ctx, channel, state, sendSMSNotification)
-		if !waitTelegram(ctx, delay) {
+		wake := s.store.SMSNotifications()
+		delay, retry := s.deliverSMSNotificationsOnce(ctx, channel, state, sendSMSNotification)
+		if retry {
+			wake = nil
+		}
+		select {
+		case <-ctx.Done():
 			return
+		case <-wake:
+		case <-time.After(delay):
 		}
 	}
 }
 
 // deliverSMSNotificationsOnce performs one scheduling tick for a channel and
-// returns how long the caller should wait before the next tick.
+// returns the delay and whether errors require waiting it in full.
 func (s *Server) deliverSMSNotificationsOnce(
 	ctx context.Context,
 	channel string,
 	state *smsNotificationCursor,
 	send smsNotificationSender,
-) time.Duration {
+) (time.Duration, bool) {
 	if !state.initialized {
-		latest, err := s.store.LatestSMSMessageID(ctx)
-		if err != nil {
-			state.logError(s, channel, err)
-			return smsNotificationPollInterval
-		}
-		state.id, state.initialized = latest, true
+		state.id, state.initialized = s.store.StartupSMSMessageID(), true
 		state.lastError = ""
 	}
+	retry := false
 	config, enabled, configErr := s.smsNotificationConfig(ctx, channel)
 	if configErr != nil {
 		state.logError(s, channel, configErr)
+		retry = true
 	} else if !enabled {
 		if newest, latestErr := s.store.LatestSMSMessageID(ctx); latestErr == nil {
 			state.id = newest
+		} else {
+			retry = true
 		}
 		state.lastError = ""
 	} else {
 		messages, listErr := s.store.ListInboundSMSAfterID(ctx, state.id, 100)
 		if listErr != nil {
 			state.logError(s, channel, listErr)
+			retry = true
 		} else {
 			for _, message := range messages {
 				if !smsMessageReadyToNotify(message) {
@@ -195,6 +201,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 				}
 				notification := s.newSMSNotification(ctx, message)
 				if sendErr := send(s.notificationDestinationContext(ctx), channel, config, notification); sendErr != nil {
+					retry = true
 					if message.ID == state.failedMessageID {
 						state.failedAttempts++
 					} else {
@@ -223,7 +230,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 			}
 		}
 	}
-	return smsNotificationRetryDelay(state.consecutiveFailures)
+	return smsNotificationRetryDelay(state.consecutiveFailures), retry || state.consecutiveFailures > 0
 }
 
 // A missing/null scope keeps the existing all-device behavior; [] sends nothing.

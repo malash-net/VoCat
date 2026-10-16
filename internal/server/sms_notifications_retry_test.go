@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -12,6 +14,74 @@ import (
 	"vocat/internal/auth"
 	"vocat/internal/store"
 )
+
+func startupSMSNotificationStore(t *testing.T) (*store.Store, store.SMSMessage) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "vocat.db")
+	archive, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = archive.Close() })
+	message := store.SMSMessage{
+		DeviceID: "device-1", Peer: "+12025550123", Direction: "inbound", Body: "history",
+	}
+	if _, err := archive.SaveSMSMessage(ctx, message); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	message.Body = "received during startup"
+	message, err = database.SaveSMSMessage(ctx, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return database, message
+}
+
+func TestSMSNotificationsIncludeStartupMessages(t *testing.T) {
+	ctx := context.Background()
+	database, message := startupSMSNotificationStore(t)
+	server := &Server{store: database, logger: regionTestLogger()}
+	for channel, config := range map[string]string{
+		"bark":     `{"urls":["https://example.com/bark"]}`,
+		"email":    `{"smtp_host":"smtp.example.com","from_address":"from@example.com","to_addresses":["to@example.com"]}`,
+		"pushplus": `{"token":"test-token"}`,
+		"webhook":  `{"urls":["https://example.com/hook"]}`,
+		"wecom":    `{"urls":["https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"],"payload_template":"{\"msgtype\":\"text\",\"text\":{\"content\":{{message}}}}"}`,
+		"lark":     `{"url":"https://open.larksuite.com/open-apis/bot/v2/hook/test","payload_template":"{\"msg_type\":\"text\",\"content\":{\"text\":{{message}}}}"}`,
+		"meow":     `{"nickname":"test"}`,
+	} {
+		t.Run(channel, func(t *testing.T) {
+			if err := database.UpsertNotificationSetting(ctx, store.NotificationSetting{
+				Channel: channel, Enabled: true, Config: json.RawMessage(config),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var delivered []string
+			sender := func(_ context.Context, _ string, _ map[string]any, notification smsNotification) error {
+				delivered = append(delivered, notification.Content)
+				return nil
+			}
+			state := &smsNotificationCursor{}
+			for range 2 {
+				if _, retry := server.deliverSMSNotificationsOnce(ctx, channel, state, sender); retry {
+					t.Fatal("unexpected notification retry")
+				}
+			}
+			if len(delivered) != 1 || delivered[0] != message.Body || state.id != message.ID {
+				t.Fatalf("delivered=%v, cursor=%d; want only startup message %d", delivered, state.id, message.ID)
+			}
+		})
+	}
+}
 
 // TestSMSNotificationFailureDoesNotStallLaterMessages verifies that a provider
 // permanently rejecting one SMS does not stall every later notification for
@@ -58,10 +128,7 @@ func TestSMSNotificationFailureDoesNotStallLaterMessages(t *testing.T) {
 		return nil
 	}
 
-	// The first tick initializes the channel cursor to the current max id, so
-	// run it before inserting the messages the dispatcher should deliver.
 	state := &smsNotificationCursor{}
-	server.deliverSMSNotificationsOnce(ctx, "webhook", state, sender)
 
 	for _, body := range []string{"first", "second"} {
 		if _, err := database.SaveSMSMessage(ctx, store.SMSMessage{

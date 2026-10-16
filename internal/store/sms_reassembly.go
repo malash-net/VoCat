@@ -91,8 +91,10 @@ func mergeConcatSegment(
 	// Seed the per-segment texts from the previously stored parts so an
 	// out-of-order arrival always rebuilds in sequence order.
 	parts := map[int]string{}
+	var existingAT any
 	if len(existingExtra) > 0 {
 		if existing, derr := decodeJSONObject(existingExtra); derr == nil {
+			existingAT = existing["at_concat"]
 			if stored, ok := existing["concat_parts"].(map[string]any); ok {
 				for key, value := range stored {
 					n, aerr := strconv.Atoi(key)
@@ -137,10 +139,16 @@ func mergeConcatSegment(
 		"concat_complete": complete,
 	}
 	// Preserve non-concat metadata from the latest segment for context.
-	for _, key := range []string{"encoding", "storage", "transport", "source", "keep_durable_id_on_rescan"} {
+	for _, key := range []string{"encoding", "storage", "transport", "source", "keep_durable_id_on_rescan", "at_concat"} {
 		if value, ok := segment[key]; ok {
 			merged[key] = value
 		}
+	}
+	if _, ok := merged["at_concat"]; !ok && existingAT != nil {
+		merged["at_concat"] = existingAT
+	}
+	if metadata, ok := merged["at_concat"].(map[string]any); ok && metadata["isolated"] == true {
+		merged["concat_complete"] = false
 	}
 	// Concatenated WAP Push MMS notifications arrive as hex 8-bit segments.
 	// Decode the joined payload so the inbox and notifications show the

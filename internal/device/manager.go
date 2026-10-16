@@ -50,6 +50,7 @@ type Manager struct {
 	networkEventSubscribers map[chan string]struct{}
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
+	smsNotifications        chan struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -142,11 +143,14 @@ type managedDevice struct {
 }
 
 func NewManager(options Options) (*Manager, error) {
+	smsNotifications := make(chan struct{}, 1)
 	if options.Discoverer == nil {
 		options.Discoverer = modem.NewSystemDiscoverer()
 	}
 	if options.Opener == nil {
-		options.Opener = modem.SerialOpener{}
+		options.Opener = modem.SerialOpener{
+			SessionOptions: modem.SessionOptions{SMSNotify: smsNotifications},
+		}
 	}
 	if options.CommandTimeout <= 0 {
 		options.CommandTimeout = 3 * time.Second
@@ -181,12 +185,19 @@ func NewManager(options Options) (*Manager, error) {
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
+		smsNotifications:              smsNotifications,
 
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
 		esimRecoveries: make(map[string]*esimRecovery),
 		esimCache:      make(map[string]EsimInfo),
 	}, nil
+}
+
+// SMSNotifications provides coalesced modem wakeups for one SMS sync loop.
+// The channel stays open across device disconnects and session replacements.
+func (manager *Manager) SMSNotifications() <-chan struct{} {
+	return manager.smsNotifications
 }
 
 func (manager *Manager) Start(ctx context.Context) error {

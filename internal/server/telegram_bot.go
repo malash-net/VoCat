@@ -2289,31 +2289,24 @@ func (bot *telegramBot) sendSMSNotification(ctx context.Context, config telegram
 }
 
 func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
-	cursorInitialized := false
-	var cursor int64
+	cursor := bot.server.store.StartupSMSMessageID()
 	for ctx.Err() == nil {
-		if !cursorInitialized {
-			latest, err := bot.server.store.LatestSMSMessageID(ctx)
-			if err != nil {
-				bot.warn("initialize Telegram SMS cursor", err)
-				if !waitTelegram(ctx, telegramNotificationPeriod) {
-					return
-				}
-				continue
-			}
-			cursor, cursorInitialized = latest, true
-		}
+		wake := bot.server.store.SMSNotifications()
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
 			bot.warn("load Telegram SMS notification configuration", err)
+			wake = nil
 		} else if !enabled {
 			if latest, latestErr := bot.server.store.LatestSMSMessageID(ctx); latestErr == nil {
 				cursor = latest
+			} else {
+				wake = nil
 			}
 		} else {
 			messages, listErr := bot.server.store.ListInboundSMSAfterID(ctx, cursor, 100)
 			if listErr != nil {
 				bot.warn("list Telegram SMS notifications", listErr)
+				wake = nil
 			} else {
 				for _, message := range messages {
 					if !smsMessageReadyToNotify(message) {
@@ -2325,14 +2318,19 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 					}
 					if sendErr := bot.sendSMSNotification(ctx, config, message); sendErr != nil {
 						bot.warn("send Telegram SMS notification", sendErr)
+						wake = nil
 						break
 					}
 					cursor = message.ID
 				}
 			}
 		}
-		if !waitTelegram(ctx, telegramNotificationPeriod) {
+		// New messages bypass the polling delay, but never shorten error retries.
+		select {
+		case <-ctx.Done():
 			return
+		case <-wake:
+		case <-time.After(telegramNotificationPeriod):
 		}
 	}
 }

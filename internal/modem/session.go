@@ -24,6 +24,7 @@ type SessionOptions struct {
 	ReadTimeout    time.Duration
 	CommandTimeout time.Duration
 	MaxURCs        int
+	SMSNotify      chan<- struct{}
 }
 
 func (options SessionOptions) withDefaults() SessionOptions {
@@ -257,12 +258,35 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 func (session *Session) readLoop() {
 	defer close(session.readDone)
 	buffer := make([]byte, 1024)
+	const smsPrefix = "+CMTI:"
+	var linePrefix [len(smsPrefix)]byte
+	prefixLength := 0
 	for session.lifetime.Err() == nil {
 		count, err := session.transport.Read(buffer)
 		if count == 0 && (err == nil || errors.Is(err, syscall.EINTR)) {
 			continue
 		}
 		batch := atRead{data: append([]byte(nil), buffer[:max(count, 0)]...), err: err}
+		// Observe complete CMTI lines even while idle, without consuming the
+		// command/URC stream or buffering the rest of a potentially long line.
+		if session.options.SMSNotify != nil {
+			for _, value := range batch.data {
+				if value == '\r' || value == '\n' {
+					if string(linePrefix[:prefixLength]) == smsPrefix {
+						select {
+						case session.options.SMSNotify <- struct{}{}:
+						default:
+						}
+					}
+					prefixLength = 0
+				} else if prefixLength == 0 && (value == ' ' || value == '\t') {
+					continue
+				} else if prefixLength < len(linePrefix) {
+					linePrefix[prefixLength] = value
+					prefixLength++
+				}
+			}
+		}
 		if err != nil {
 			session.poisoned.Store(true)
 		}

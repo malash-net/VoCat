@@ -14,12 +14,13 @@ import (
 type contextQueryExecer interface {
 	contextExecer
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 // SaveSMSMessage inserts a new message or updates an existing record. A
 // non-empty (device_id, message_id) pair is idempotent for modem retries.
 func (s *Store) SaveSMSMessage(ctx context.Context, value SMSMessage) (SMSMessage, error) {
-	result, err := s.saveSMSMessageTransaction(ctx, value, false)
+	result, err := s.SaveSMSMessageWithResult(ctx, value)
 	return result.Message, err
 }
 
@@ -36,24 +37,14 @@ type SMSMessageSaveResult struct {
 // timestamps: timestamps are stored with one-second precision and unchanged
 // concatenated-message rescans can legitimately retain equal timestamps.
 func (s *Store) SaveSMSMessageWithResult(ctx context.Context, value SMSMessage) (SMSMessageSaveResult, error) {
-	return s.saveSMSMessageTransaction(ctx, value, true)
-}
-
-func (s *Store) saveSMSMessageTransaction(
-	ctx context.Context,
-	value SMSMessage,
-	detectInsertion bool,
-) (SMSMessageSaveResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return SMSMessageSaveResult{}, fmt.Errorf("begin SMS update: %w", err)
 	}
 	defer tx.Rollback()
 	var previousMaxID int64
-	if detectInsertion {
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sms_messages`).Scan(&previousMaxID); err != nil {
-			return SMSMessageSaveResult{}, fmt.Errorf("read SMS insertion cursor: %w", err)
-		}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sms_messages`).Scan(&previousMaxID); err != nil {
+		return SMSMessageSaveResult{}, fmt.Errorf("read SMS insertion cursor: %w", err)
 	}
 	saved, err := saveSMSMessage(ctx, tx, value)
 	if err != nil {
@@ -62,17 +53,32 @@ func (s *Store) saveSMSMessageTransaction(
 	if err := tx.Commit(); err != nil {
 		return SMSMessageSaveResult{}, fmt.Errorf("commit SMS update: %w", err)
 	}
+	inserted := saved.ID > previousMaxID
+	if inserted && (saved.Direction == "inbound" || saved.Direction == "received") {
+		s.signalSMSNotification()
+	}
 	return SMSMessageSaveResult{
 		Message:  saved,
-		Inserted: detectInsertion && saved.ID > previousMaxID,
+		Inserted: inserted,
 	}, nil
 }
 
-func saveSMSMessage(
-	ctx context.Context,
-	executor contextQueryExecer,
-	value SMSMessage,
-) (SMSMessage, error) {
+// SMSNotifications returns a channel closed when new inbound messages commit.
+// Each consumer must fetch it before querying messages on every scheduling tick.
+func (s *Store) SMSNotifications() <-chan struct{} {
+	s.smsNotificationsMu.Lock()
+	defer s.smsNotificationsMu.Unlock()
+	return s.smsNotifications
+}
+
+func (s *Store) signalSMSNotification() {
+	s.smsNotificationsMu.Lock()
+	defer s.smsNotificationsMu.Unlock()
+	close(s.smsNotifications)
+	s.smsNotifications = make(chan struct{})
+}
+
+func normalizeSMSMessageIdentity(value *SMSMessage) {
 	value.DeviceID = strings.TrimSpace(value.DeviceID)
 	value.ModemIMEI = strings.TrimSpace(value.ModemIMEI)
 	value.ICCID = strings.TrimSpace(value.ICCID)
@@ -80,6 +86,14 @@ func saveSMSMessage(
 	value.LocalPhone = strings.TrimSpace(value.LocalPhone)
 	value.Peer = strings.TrimSpace(value.Peer)
 	value.Direction = strings.ToLower(strings.TrimSpace(value.Direction))
+}
+
+func saveSMSMessage(
+	ctx context.Context,
+	executor contextQueryExecer,
+	value SMSMessage,
+) (SMSMessage, error) {
+	normalizeSMSMessageIdentity(&value)
 	if value.DeviceID == "" {
 		return SMSMessage{}, errors.New("SMS device id is required")
 	}
@@ -102,6 +116,10 @@ func saveSMSMessage(
 		return SMSMessage{}, fmt.Errorf("normalize SMS extra data: %w", err)
 	}
 	now := time.Now().UTC()
+	extra, metadataChanged, err := resolveModemSMS(ctx, executor, &value, extra, now)
+	if err != nil {
+		return SMSMessage{}, err
+	}
 
 	// Concatenated (long) SMS arrive as one segment per delivery. Ingest points
 	// address the whole message with a stable "concat:" message id and carry the
@@ -149,9 +167,12 @@ func saveSMSMessage(
 			}
 			preserveSMSSubscriptionIdentity(&value, existing)
 			if !changed {
-				if value.Read != existing.Read {
-					if _, err := executor.ExecContext(ctx, `UPDATE sms_messages SET is_read = ?, updated_at = ? WHERE id = ?`, boolInt(value.Read), now.Unix(), existing.ID); err != nil {
-						return SMSMessage{}, fmt.Errorf("update concatenated SMS read state: %w", err)
+				if value.Read != existing.Read || metadataChanged {
+					if metadataChanged {
+						existing.Extra = mergedExtra
+					}
+					if _, err := executor.ExecContext(ctx, `UPDATE sms_messages SET is_read = ?, extra_json = ?, updated_at = ? WHERE id = ?`, boolInt(value.Read), string(existing.Extra), now.Unix(), existing.ID); err != nil {
+						return SMSMessage{}, fmt.Errorf("update concatenated SMS metadata: %w", err)
 					}
 					existing.Read = value.Read
 				}
@@ -333,18 +354,33 @@ func saveSMSMessage(
 }
 
 func (s *Store) SaveSMSMessages(ctx context.Context, values []SMSMessage) error {
+	if err := s.PrepareModemSMSBatch(ctx, values); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin SMS batch: %w", err)
 	}
 	defer tx.Rollback()
+	var previousMaxID int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sms_messages`).Scan(&previousMaxID); err != nil {
+		return fmt.Errorf("read SMS insertion cursor: %w", err)
+	}
+	notify := false
 	for index, value := range values {
-		if _, err := saveSMSMessage(ctx, tx, value); err != nil {
+		saved, err := saveSMSMessage(ctx, tx, value)
+		if err != nil {
 			return fmt.Errorf("save SMS batch item %d: %w", index, err)
+		}
+		if saved.ID > previousMaxID && (saved.Direction == "inbound" || saved.Direction == "received") {
+			notify = true
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit SMS batch: %w", err)
+	}
+	if notify {
+		s.signalSMSNotification()
 	}
 	return nil
 }

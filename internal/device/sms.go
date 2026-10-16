@@ -191,6 +191,7 @@ func (manager *Manager) ListSMS(
 			fmt.Sprintf("AT+CPMS=%q", storage),
 		)
 		if err != nil {
+			listing.Incomplete = true
 			lastErr = err
 			continue
 		}
@@ -204,6 +205,7 @@ func (manager *Manager) ListSMS(
 		}
 		response, err = manager.command(ctx, client, "AT+CMGL=4")
 		if err != nil {
+			listing.Incomplete = true
 			lastErr = err
 			continue
 		}
@@ -215,7 +217,7 @@ func (manager *Manager) ListSMS(
 	}
 	if !listed && lastErr != nil {
 		manager.setResult(id, state, nil, lastErr)
-		return SMSListing{}, lastErr
+		return listing, lastErr
 	}
 	// New MT SMS follows mem1. Leave SM selected so a burst between scans
 	// lands in the larger SIM mailbox instead of the 23-slot ME area.

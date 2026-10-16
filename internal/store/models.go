@@ -185,6 +185,9 @@ type SMSMessage struct {
 	Extra         json.RawMessage
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+
+	// Computed before any batch writes; never persisted or serialized.
+	modemBatchConflict bool
 }
 
 type SMSFilter struct {

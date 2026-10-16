@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,44 @@ import (
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
 )
+
+type telegramSMSRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip telegramSMSRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func TestTelegramSMSIncludesStartupMessages(t *testing.T) {
+	database, message := startupSMSNotificationStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := database.UpsertNotificationSetting(ctx, store.NotificationSetting{
+		Channel: "telegram", Enabled: true,
+		Config: json.RawMessage(`{"bot_token":"123456:abcdefghijklmnopqrstuvwxyz","chat_id":"123","base_url":"https://8.8.8.8"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var delivered []string
+	bot := &telegramBot{
+		server: &Server{store: database, logger: regionTestLogger()},
+		client: &http.Client{Transport: telegramSMSRoundTripper(func(request *http.Request) (*http.Response, error) {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Error(err)
+				return nil, err
+			}
+			delivered = append(delivered, payload.Text)
+			cancel()
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+		})},
+	}
+	bot.notifyInboundSMS(ctx)
+	if len(delivered) != 1 || !strings.Contains(delivered[0], message.Body) {
+		t.Fatalf("delivered = %v, want only startup message %q", delivered, message.Body)
+	}
+}
 
 func TestTelegramAPIURLSupportsBaseAndTemplate(t *testing.T) {
 	tests := []struct {
