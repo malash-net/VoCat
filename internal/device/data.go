@@ -161,6 +161,61 @@ func (manager *Manager) publishNetworkStatusEvent(deviceID string) {
 	}
 }
 
+// SubscribeSMSArrivalEvents subscribes to modem-side new-SMS indications. The
+// channel carries the physical device ID and is only a wake-up signal: the
+// consumer scans modem storage to find the message, so a dropped or spurious
+// signal changes nothing but latency.
+func (manager *Manager) SubscribeSMSArrivalEvents(ctx context.Context) (<-chan string, error) {
+	if manager == nil {
+		return nil, ErrDataBackendUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	events := make(chan string, 1)
+	manager.smsArrivalMu.Lock()
+	if manager.smsArrivalSubscribers == nil {
+		manager.smsArrivalSubscribers = make(map[chan string]struct{})
+	}
+	manager.smsArrivalSubscribers[events] = struct{}{}
+	manager.smsArrivalMu.Unlock()
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			manager.removeSMSArrivalSubscriber(events)
+		}()
+	}
+	return events, nil
+}
+
+func (manager *Manager) removeSMSArrivalSubscriber(events chan string) {
+	manager.smsArrivalMu.Lock()
+	defer manager.smsArrivalMu.Unlock()
+	if _, ok := manager.smsArrivalSubscribers[events]; !ok {
+		return
+	}
+	delete(manager.smsArrivalSubscribers, events)
+	close(events)
+}
+
+// publishSMSArrivalEvent reports that one physical modem signalled a new SMS.
+// It runs on the AT session's read goroutine, so it must never block.
+func (manager *Manager) publishSMSArrivalEvent(deviceID string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return
+	}
+	manager.smsArrivalMu.Lock()
+	defer manager.smsArrivalMu.Unlock()
+	for events := range manager.smsArrivalSubscribers {
+		select {
+		case events <- deviceID:
+		default:
+			// A pending wake-up is enough; the periodic scan is the safety net.
+		}
+	}
+}
+
 // ValidAPN reports whether value can safely be used as a modem PDP-context APN.
 // An empty value is valid and means that the modem/operator default should be used.
 func ValidAPN(value string) bool {

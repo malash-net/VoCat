@@ -32,6 +32,11 @@ type fakeDeviceController struct {
 	usbNetErr   error
 	smsMessages []device.SMSMessage
 	smsErr      error
+	smsEvents   chan string
+}
+
+func (f fakeDeviceController) SubscribeSMSArrivalEvents(context.Context) (<-chan string, error) {
+	return f.smsEvents, nil
 }
 
 func (f fakeDeviceController) Discover(context.Context) ([]device.Device, error) {

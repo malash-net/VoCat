@@ -98,6 +98,7 @@ type Server struct {
 	cellularDataEventOnce     sync.Once
 	cellularDataLifecycleOnce sync.Once
 	cellularData              *cellularDataRuntime
+	smsArrivalOnce            sync.Once
 }
 
 func New(options Options) (*Server, error) {

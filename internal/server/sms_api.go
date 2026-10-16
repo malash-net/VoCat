@@ -684,7 +684,8 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
 		// OpenStick 410 controls cellular registration through QMI but receives
 		// stored SMS through its AT port. Its firmware can reset CNMI after a
-		// profile switch, leaving newly delivered SMS invisible to VoCat.
+		// profile switch, leaving newly delivered SMS invisible to VoCat. Other
+		// modems already default to this value, so only the 410 is reasserted.
 		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
 			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
 			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
@@ -1116,6 +1117,138 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
 		}
+	}
+}
+
+// smsArrivalDebounce groups the indications a burst produces — the segments of
+// one long message, or several messages landing together — into a single
+// storage scan, since each scan costs roughly six AT commands per device under
+// the global smsSyncMu.
+const smsArrivalDebounce = 300 * time.Millisecond
+
+// smsArrivalMaxWait caps how long the quiet period may be extended, so a modem
+// that signals continuously still gets scanned instead of starving behind its
+// own debounce.
+const smsArrivalMaxWait = 2 * time.Second
+
+// StartSMSArrivalReconciler persists inbound cellular SMS as soon as the modem
+// reports one, instead of waiting for the next periodic scan. The periodic
+// StartSMSSyncLoop remains the safety net for firmware that never signals and
+// for VoWiFi devices that arrive over IMS rather than AT.
+func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.smsArrivalOnce.Do(func() {
+		go s.runSMSArrivalReconciler(ctx)
+	})
+}
+
+func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
+	source, ok := s.devices.(cellularSMSArrivalEventController)
+	if !ok {
+		return
+	}
+	events, err := source.SubscribeSMSArrivalEvents(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
+		}
+		return
+	}
+	// A nil channel would block this goroutine forever.
+	if events == nil {
+		return
+	}
+	// pending holds the devices seen since the last scan. The timer is reset on
+	// every indication so a burst collapses into one pass.
+	pending := make(map[string]struct{})
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	var windowStart time.Time
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+			timer, timerC = nil, nil
+		}
+	}
+	defer stopTimer()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case physicalID, ok := <-events:
+			if !ok {
+				return
+			}
+			physicalID = strings.TrimSpace(physicalID)
+			if physicalID == "" {
+				continue
+			}
+			pending[physicalID] = struct{}{}
+			if timer == nil {
+				windowStart = time.Now()
+				timer = time.NewTimer(smsArrivalDebounce)
+				timerC = timer.C
+				continue
+			}
+			// Clamped so the window cannot be extended past the hard deadline.
+			remaining := smsArrivalMaxWait - time.Since(windowStart)
+			if remaining <= smsArrivalDebounce {
+				continue
+			}
+			resetTimer(timer, smsArrivalDebounce)
+		case <-timerC:
+			timer, timerC = nil, nil
+			targets := pending
+			pending = make(map[string]struct{})
+			s.syncModemSMSForPhysicalDevices(ctx, targets)
+		}
+	}
+}
+
+// resetTimer restarts a timer, draining an already-delivered value so the
+// reset is not consumed by it.
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(delay)
+}
+
+// syncModemSMSForPhysicalDevices scans the configured devices backing the given
+// physical modems, falling back to a full scan so an indication is never
+// silently dropped.
+func (s *Server) syncModemSMSForPhysicalDevices(ctx context.Context, physicalIDs map[string]struct{}) {
+	configs, err := s.store.ListDevices(ctx)
+	if err != nil {
+		s.logger.Warn("list devices for SMS arrival synchronization failed", "error", err)
+		return
+	}
+	// syncModemSMS matches onlyDevice against the stored config ID, while an
+	// indication carries the physical device ID.
+	resolved := make(map[string]struct{}, len(physicalIDs))
+	for _, config := range configs {
+		_, physicalID, present := s.physicalForConfig(config)
+		if !present {
+			continue
+		}
+		if _, wanted := physicalIDs[physicalID]; wanted {
+			resolved[config.ID] = struct{}{}
+		}
+	}
+	if len(resolved) == 0 {
+		s.syncModemSMS(ctx, "")
+		return
+	}
+	for configID := range resolved {
+		s.syncModemSMS(ctx, configID)
 	}
 }
 

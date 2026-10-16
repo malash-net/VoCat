@@ -337,6 +337,127 @@ func TestSessionIdleInputStaysUnsolicited(t *testing.T) {
 	})
 }
 
+func TestSessionSMSArrivalHandlerFiresOnIdleIndication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// No command is ever issued, so the URC parser never runs.
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 1)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		transport := transportForSession(t, session)
+		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+		default:
+			t.Fatal("idle +CMTI did not invoke the arrival handler")
+		}
+	})
+}
+
+func TestSessionSMSArrivalHandlerMatchesSplitIndication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 4)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		transport := transportForSession(t, session)
+		// The prefix straddles a read boundary, so detection uses the tail.
+		transport.enqueue("\r\n+CM", "TI: \"SM\",7\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+		default:
+			t.Fatal("split +CMTI was not detected")
+		}
+	})
+}
+
+func TestSessionSMSArrivalHandlerIgnoresNonIndications(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 4)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		transport := transportForSession(t, session)
+		// Command echo, the AT+CNMI? response, +CMGL: and +CMGR: must not match.
+		transport.enqueue("\r\nAT+CNMI=2,1,0,0,0\r\n")
+		transport.enqueue("\r\n+CNMI: 2,1,0,0,0\r\n")
+		transport.enqueue("\r\n+CMGL: 7,1,,25\r\n")
+		transport.enqueue("\r\n+CMGR: 1,,25\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+			t.Fatal("a non-indication line invoked the arrival handler")
+		default:
+		}
+	})
+}
+
+func TestSessionSMSArrivalHandlerClearedByNil(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 4)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		session.SetSMSArrivalHandler(nil)
+		transport := transportForSession(t, session)
+		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+			t.Fatal("cleared handler was still invoked")
+		default:
+		}
+	})
+}
+
+// Sniffing must not disturb a command's response, and the indication must
+// still reach WaitURC as a normal URC.
+func TestSessionSMSArrivalHandlerKeepsTransactionIntact(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{steps: []transportStep{
+			{write: "AT+CSQ\r", chunks: []string{"\r\n+CMTI: \"SM\",7\r\n+CS", "Q: 24,99\r\nOK\r"}},
+		}}
+		session := newTestSession(t, transport)
+		fired := make(chan struct{}, 4)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		response, err := session.Execute(context.Background(), "AT+CSQ")
+		if err != nil || response.Text() != "+CSQ: 24,99" {
+			t.Fatalf("response = %#v, %v", response, err)
+		}
+		select {
+		case <-fired:
+		default:
+			t.Fatal("interleaved +CMTI was not detected")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		line, err := session.WaitURC(ctx, func(line string) bool { return line == `+CMTI: "SM",7` })
+		if err != nil || line != `+CMTI: "SM",7` {
+			t.Fatalf("URC = %q, %v", line, err)
+		}
+	})
+}
+
+func TestSessionSMSArrivalHandlerFiresWithoutRegistration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// No handler registered: sniffing must stay a no-op rather than panic.
+		session := newTestSession(t, &transcriptTransport{})
+		transport := transportForSession(t, session)
+		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+		synctest.Wait()
+		if session.Poisoned() {
+			t.Fatal("unregistered sniffer poisoned the session")
+		}
+	})
+}
+
+func transportForSession(t *testing.T, session *Session) *transcriptTransport {
+	t.Helper()
+	transport, ok := session.transport.(*transcriptTransport)
+	if !ok {
+		t.Fatalf("session transport = %T, want *transcriptTransport", session.transport)
+	}
+	return transport
+}
+
 func TestSessionCancelsAndClosesBlockedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started, release := make(chan struct{}), make(chan struct{})
