@@ -167,12 +167,9 @@ func (s *Server) deliverSMSNotificationsOnce(
 	send smsNotificationSender,
 ) time.Duration {
 	if !state.initialized {
-		latest, err := s.store.LatestSMSMessageID(ctx)
-		if err != nil {
-			state.logError(s, channel, err)
-			return smsNotificationPollInterval
-		}
-		state.id, state.initialized = latest, true
+		// Reading MAX(id) here would swallow a message that arrived between
+		// process start and this first tick.
+		state.id, state.initialized = s.store.StartupSMSMessageID(), true
 		state.lastError = ""
 	}
 	config, enabled, configErr := s.smsNotificationConfig(ctx, channel)

@@ -2293,15 +2293,8 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 	var cursor int64
 	for ctx.Err() == nil {
 		if !cursorInitialized {
-			latest, err := bot.server.store.LatestSMSMessageID(ctx)
-			if err != nil {
-				bot.warn("initialize Telegram SMS cursor", err)
-				if !waitTelegram(ctx, telegramNotificationPeriod) {
-					return
-				}
-				continue
-			}
-			cursor, cursorInitialized = latest, true
+			// Reading MAX(id) here would swallow a startup-window arrival.
+			cursor, cursorInitialized = bot.server.store.StartupSMSMessageID(), true
 		}
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
