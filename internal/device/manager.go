@@ -576,6 +576,10 @@ type smsArrivalSubscriber interface {
 
 // registerSMSArrivalHandler points a client's new-SMS indication at this
 // manager. Clients without the capability are picked up by the periodic scan.
+//
+// The callback runs on the session's read goroutine and must stay cheap: it
+// only publishes a non-blocking wake-up. Diagnostics belong on the consumer
+// side (see the server's SMS arrival reconciler), not here.
 func (manager *Manager) registerSMSArrivalHandler(deviceID string, client modem.Client) {
 	subscriber, ok := client.(smsArrivalSubscriber)
 	if !ok {
