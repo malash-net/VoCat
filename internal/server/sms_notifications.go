@@ -194,19 +194,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 					continue
 				}
 				notification := s.newSMSNotification(ctx, message)
-				started := time.Now()
-				sendErr := send(s.notificationDestinationContext(ctx), channel, config, notification)
-				if s.logger != nil {
-					// Age is the real end-to-end latency: the gap between the
-					// message landing in the store and the provider call.
-					s.logger.Info("SMS notification dispatched",
-						"category", "sms", "event", "sms.notification.dispatched",
-						"channel", channel, "device_id", message.DeviceID,
-						"age_ms", started.Sub(message.CreatedAt).Milliseconds(),
-						"send_ms", time.Since(started).Milliseconds(),
-						"error", sendErr)
-				}
-				if sendErr != nil {
+				if sendErr := send(s.notificationDestinationContext(ctx), channel, config, notification); sendErr != nil {
 					if message.ID == state.failedMessageID {
 						state.failedAttempts++
 					} else {
