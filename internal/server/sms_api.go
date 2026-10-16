@@ -1141,7 +1141,6 @@ func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
 func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	source, ok := s.devices.(cellularSMSArrivalEventController)
 	if !ok {
-		s.logSMSArrivalUnavailable("device backend cannot report modem SMS indications")
 		return
 	}
 	events, err := source.SubscribeSMSArrivalEvents(ctx)
@@ -1153,7 +1152,6 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	}
 	// A nil channel would block this goroutine forever.
 	if events == nil {
-		s.logSMSArrivalUnavailable("device backend returned no SMS arrival channel")
 		return
 	}
 	// Indications arriving while the throttle runs accumulate into one scan.
@@ -1188,15 +1186,6 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 	}
 }
 
-// logSMSArrivalUnavailable reports that inbound SMS falls back to the periodic
-// scan, so a silent absence of arrival logs is explainable.
-func (s *Server) logSMSArrivalUnavailable(message string) {
-	if s.logger != nil {
-		s.logger.Info(message+"; only the periodic scan runs",
-			"category", "sms", "event", "sms.arrival.unavailable")
-	}
-}
-
 // syncModemSMSForPhysicalDevices scans the configured devices backing the given
 // physical modems, falling back to a full scan so an indication is never
 // silently dropped.
@@ -1219,10 +1208,6 @@ func (s *Server) syncModemSMSForPhysicalDevices(ctx context.Context, physicalIDs
 		}
 	}
 	if len(resolved) == 0 {
-		if s.logger != nil {
-			s.logger.Debug("modem SMS indication matched no configured device; scanning every device",
-				"category", "sms", "event", "sms.arrival.unresolved")
-		}
 		s.syncModemSMS(ctx, "")
 		return
 	}
