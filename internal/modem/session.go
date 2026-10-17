@@ -52,6 +52,10 @@ type Session struct {
 	pending   *atTransaction
 	poisoned  atomic.Bool
 	busy      atomic.Bool
+	// idleBuf holds bytes read while nobody consumed received. Only readLoop
+	// appends; the transaction start drains it under the gate.
+	idleMu  sync.Mutex
+	idleBuf []byte
 
 	// See SetSMSArrivalHandler.
 	smsArrivalHandler atomic.Pointer[func()]
@@ -199,6 +203,7 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	}
 	// Never assign an old reply (including idle input and partial trailing
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
+	session.drainIdleLocked()
 	session.busy.Store(true)
 	defer func() {
 		if session.pending == nil {
@@ -290,10 +295,15 @@ func (session *Session) readLoop() {
 				return
 			}
 		} else {
-			select {
-			case session.received <- batch:
-			default:
+			// Nobody drains received while idle, so blocking would stop reading
+			// the port. Keep the bytes: dropping them loses partial lines and
+			// URCs a later command or WaitURC still needs.
+			session.idleMu.Lock()
+			session.idleBuf = append(session.idleBuf, batch.data...)
+			if len(session.idleBuf) > maxIdleBuffer {
+				session.idleBuf = session.idleBuf[len(session.idleBuf)-maxIdleBuffer:]
 			}
+			session.idleMu.Unlock()
 		}
 		if err != nil {
 			return
@@ -335,6 +345,10 @@ func (session *Session) sniffSMSArrival(data []byte) {
 	session.smsScanTail = append(session.smsScanTail[:0], scanned[len(scanned)-tail:]...)
 }
 
+// maxIdleBuffer bounds bytes accumulated while nothing consumes the session.
+// Idle traffic is unsolicited, so an unbounded buffer would grow forever.
+const maxIdleBuffer = 64 << 10
+
 func (session *Session) receivePendingLocked() {
 	for {
 		select {
@@ -344,6 +358,18 @@ func (session *Session) receivePendingLocked() {
 		default:
 			return
 		}
+	}
+}
+
+// drainIdleLocked folds bytes read while idle into the command buffer, keeping
+// their original order ahead of anything received later.
+func (session *Session) drainIdleLocked() {
+	session.idleMu.Lock()
+	idle := session.idleBuf
+	session.idleBuf = nil
+	session.idleMu.Unlock()
+	if len(idle) > 0 {
+		session.readBuf = append(idle, session.readBuf...)
 	}
 }
 
@@ -538,6 +564,7 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 	}
 	session.busy.Store(true)
 	defer session.busy.Store(false)
+	session.drainIdleLocked()
 	for {
 		for index, line := range session.urcs {
 			if predicate(line) {

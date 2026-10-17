@@ -409,6 +409,27 @@ func TestSessionSMSArrivalHandlerKeepsTransactionIntact(t *testing.T) {
 	})
 }
 
+// Bytes read while idle must be retained: a partial line whose tail is dropped
+// would make the next command wait for it forever.
+func TestSessionIdleBytesAreRetained(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{}
+		session := newTestSession(t, transport)
+		for index := 0; index < 16; index++ {
+			transport.enqueue("+CREG: 0,1\r\n")
+		}
+		transport.enqueue("+CUSD: 0,")
+		synctest.Wait()
+
+		session.idleMu.Lock()
+		idle := string(session.idleBuf)
+		session.idleMu.Unlock()
+		if !strings.Contains(idle, "+CUSD: 0,") {
+			t.Fatalf("idle bytes were dropped: %q", idle)
+		}
+	})
+}
+
 func TestSessionSMSArrivalHandlerSurvivesIdleBacklog(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		session := newTestSession(t, &transcriptTransport{})
