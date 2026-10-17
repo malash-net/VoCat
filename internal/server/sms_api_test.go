@@ -802,3 +802,66 @@ func TestHandleSMSSendEnforcesGlobalHourlyLimit(t *testing.T) {
 		t.Fatalf("error code = %q, want sms_rate_limited", envelope.Error.Code)
 	}
 }
+
+type smsArrivalController struct {
+	fakeDeviceController
+	arrivals chan string
+	listed   chan string
+}
+
+func (controller smsArrivalController) SubscribeSMSEvents(context.Context) (<-chan string, error) {
+	return controller.arrivals, nil
+}
+
+func (controller smsArrivalController) ListSMS(_ context.Context, physicalID string) (device.SMSListing, error) {
+	controller.listed <- physicalID
+	return device.SMSListing{}, nil
+}
+
+func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const deviceID = "ec20-1"
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	controller := smsArrivalController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{
+			ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{DeviceID: deviceID},
+		}},
+		arrivals: make(chan string, 2),
+		listed:   make(chan string, 4),
+	}
+	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.StartSMSSyncLoop(ctx, time.Hour)
+	}()
+
+	// An arrival on a modem that is not configured must not scan the others.
+	controller.arrivals <- "other-modem"
+	controller.arrivals <- deviceID
+	select {
+	case physicalID := <-controller.listed:
+		if physicalID != deviceID {
+			t.Fatalf("scanned %q, want %q", physicalID, deviceID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SMS arrival event did not trigger a modem scan")
+	}
+	select {
+	case physicalID := <-controller.listed:
+		t.Fatalf("unexpected extra scan of %q", physicalID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}

@@ -639,6 +639,12 @@ func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText
 }
 
 func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
+	s.syncModemSMSFor(ctx, onlyDevice, "")
+}
+
+// syncModemSMSFor scans modem storage for every configured device, or only
+// the device configured as onlyDevice and/or attached as onlyPhysical.
+func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical string) {
 	s.smsSyncMu.Lock()
 	defer s.smsSyncMu.Unlock()
 	if s.devices == nil {
@@ -678,21 +684,13 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			}
 		}
 		entry, physicalID, present := s.physicalForConfig(config)
-		if !present {
+		if !present || (onlyPhysical != "" && physicalID != onlyPhysical) {
 			continue
 		}
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
-		// OpenStick 410 controls cellular registration through QMI but receives
-		// stored SMS through its AT port. Its firmware can reset CNMI after a
-		// profile switch, leaving newly delivered SMS invisible to VoCat.
-		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
-			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
-			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
-			cancelSetup()
-			if setupErr != nil {
-				s.logger.Debug("OpenStick 410 cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
-			}
-		}
+		// ListSMS re-asserts AT+CNMI on every scan: firmware such as the
+		// OpenStick 410 resets it after a profile switch, which would otherwise
+		// leave newly delivered SMS invisible or unannounced.
 		listContext, cancelList := context.WithTimeout(ctx, 30*time.Second)
 		listing, err := s.devices.ListSMS(listContext, physicalID)
 		cancelList()
@@ -1099,13 +1097,33 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	}
 }
 
-// StartSMSSyncLoop periodically persists inbound cellular SMS even when no
-// client has the SMS page open. The first tick is delayed so startup SIM/AKA
-// work gets exclusive use of the modem. Stable VoWiFi sessions still scan SM
-// and ME as a catch-up path for messages delivered while the card was offline.
+// smsArrivalSettleDelay gives the modem time to finish writing a message that
+// it announced with +CMTI and lets the remaining segments of a concatenated
+// SMS arrive, so one scan usually stores the complete message.
+const smsArrivalSettleDelay = 500 * time.Millisecond
+
+type cellularSMSEventController interface {
+	SubscribeSMSEvents(context.Context) (<-chan string, error)
+}
+
+// StartSMSSyncLoop persists inbound cellular SMS even when no client has the
+// SMS page open. A +CMTI indication triggers an immediate scan of that modem;
+// the periodic tick remains the safety net for modems that do not announce
+// new messages. The first tick is delayed so startup SIM/AKA work gets
+// exclusive use of the modem. Stable VoWiFi sessions still scan SM and ME as a
+// catch-up path for messages delivered while the card was offline.
 func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
+	}
+	var arrivals <-chan string
+	if source, ok := s.devices.(cellularSMSEventController); ok {
+		subscribed, err := source.SubscribeSMSEvents(ctx)
+		if err != nil {
+			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
+		} else {
+			arrivals = subscribed
+		}
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1115,6 +1133,15 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
+		case physicalID, ok := <-arrivals:
+			if !ok {
+				arrivals = nil
+				continue
+			}
+			if !waitTelegram(ctx, smsArrivalSettleDelay) {
+				return
+			}
+			s.syncModemSMSFor(ctx, "", physicalID)
 		}
 	}
 }

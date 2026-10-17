@@ -50,6 +50,8 @@ type Manager struct {
 	networkEventSubscribers map[chan string]struct{}
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
+	smsEventsMu             sync.Mutex
+	smsEventSubscribers     map[chan string]struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -558,6 +560,7 @@ func (manager *Manager) clientLocked(
 	if err != nil {
 		return nil, err
 	}
+	manager.watchSMSURCs(client, candidate.ID)
 	state.client = client
 	return client, nil
 }

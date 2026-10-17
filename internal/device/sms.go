@@ -178,6 +178,7 @@ func (manager *Manager) ListSMS(
 		manager.setResult(id, state, nil, err)
 		return SMSListing{}, err
 	}
+	manager.ensureSMSIndications(ctx, client)
 	listing := SMSListing{}
 	var lastErr error
 	listed := false

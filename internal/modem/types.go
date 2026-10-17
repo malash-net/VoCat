@@ -113,6 +113,12 @@ type Client interface {
 	Close() error
 }
 
+// URCNotifier is implemented by clients that can report unsolicited results
+// as they are parsed. See Session.SetURCHandler for the callback contract.
+type URCNotifier interface {
+	SetURCHandler(func(string))
+}
+
 // PromptClient performs the two-phase interaction used by AT+CMGS. The
 // implementation must hold the same command serialization lock while waiting
 // for the prompt, writing payload+Ctrl-Z, and reading the final result.
