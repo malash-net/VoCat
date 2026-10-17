@@ -281,8 +281,7 @@ func (session *Session) readLoop() {
 		if err != nil {
 			session.poisoned.Store(true)
 		}
-		if session.busy.Load() {
-			idle := session.idleSignal()
+		if busy, idle := session.busySignal(); busy {
 			select {
 			case session.received <- batch:
 			case <-idle:
@@ -337,21 +336,24 @@ const maxIdleBuffer = 64 << 10
 // a readLoop already parked in the blocking send, which would otherwise never
 // re-check the flag.
 func (session *Session) setBusy(busy bool) {
+	session.idleMu.Lock()
+	defer session.idleMu.Unlock()
 	session.busy.Store(busy)
 	if busy {
 		return
 	}
-	session.idleMu.Lock()
 	close(session.idle)
 	session.idle = make(chan struct{})
-	session.idleMu.Unlock()
 }
 
-// idleSignal returns the channel closed when the session next goes idle.
-func (session *Session) idleSignal() <-chan struct{} {
+// busySignal atomically reports whether a reader is draining and, if so, the
+// channel that closes when it stops. Sampling the two separately would let a
+// caller go idle in between, leaving readLoop parked on a channel that will
+// never close.
+func (session *Session) busySignal() (bool, <-chan struct{}) {
 	session.idleMu.Lock()
 	defer session.idleMu.Unlock()
-	return session.idle
+	return session.busy.Load(), session.idle
 }
 
 func (session *Session) receivePendingLocked() {
