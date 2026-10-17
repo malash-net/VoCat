@@ -1119,7 +1119,7 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 const smsArrivalSettleDelay = 500 * time.Millisecond
 
 type cellularSMSEventController interface {
-	SubscribeSMSEvents(context.Context) (<-chan string, error)
+	SubscribeSMSEvents(context.Context) (*device.SMSEvents, error)
 }
 
 // StartSMSSyncLoop persists inbound cellular SMS even when no client has the
@@ -1132,13 +1132,14 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
-	var arrivals <-chan string
+	var arrivals *device.SMSEvents
+	var wake <-chan struct{}
 	if source, ok := s.devices.(cellularSMSEventController); ok {
 		subscribed, err := source.SubscribeSMSEvents(ctx)
 		if err != nil {
 			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
 		} else {
-			arrivals = subscribed
+			arrivals, wake = subscribed, subscribed.Wake()
 		}
 	}
 	ticker := time.NewTicker(interval)
@@ -1149,15 +1150,20 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
-		case physicalID, ok := <-arrivals:
+		case _, ok := <-wake:
 			if !ok {
-				arrivals = nil
+				wake = nil
 				continue
 			}
 			if !waitTelegram(ctx, smsArrivalSettleDelay) {
 				return
 			}
-			s.syncModemSMSFor(ctx, "", physicalID)
+			// Take after the settle delay so every arrival during it, from any
+			// modem, is folded into this pass. Arrivals during the scans below
+			// stay pending and re-signal wake for the next pass.
+			for _, physicalID := range arrivals.Take() {
+				s.syncModemSMSFor(ctx, "", physicalID)
+			}
 		}
 	}
 }

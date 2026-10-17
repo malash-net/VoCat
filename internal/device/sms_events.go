@@ -3,8 +3,10 @@ package device
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"vocat/internal/modem"
@@ -14,25 +16,67 @@ import (
 // stalling its AT port on every storage scan.
 const smsIndicationRetryDelay = 10 * time.Minute
 
-// smsEventBuffer lets a burst of arrivals on several modems queue one wake-up
-// per modem; further arrivals are coalesced because a sync reads all storage.
-const smsEventBuffer = 16
+// SMSEvents is one subscription to modem SMS arrival indications. Arrivals
+// are coalesced per physical device: any number of indications from one modem
+// before the next Take collapse into a single pending entry, so a burst on one
+// modem can never crowd out another modem's wake-up.
+type SMSEvents struct {
+	mu      sync.Mutex
+	pending map[string]struct{}
+	wake    chan struct{}
+}
+
+// NewSMSEvents returns an empty subscription. Manager creates its own through
+// SubscribeSMSEvents; other event sources and tests can feed one with Add.
+func NewSMSEvents() *SMSEvents {
+	return &SMSEvents{pending: make(map[string]struct{}), wake: make(chan struct{}, 1)}
+}
+
+// Wake receives a value whenever at least one device became pending since the
+// last Take. It is closed when the subscription ends.
+func (events *SMSEvents) Wake() <-chan struct{} { return events.wake }
+
+// Take returns and clears the devices with pending arrivals. An arrival that
+// lands after Take is kept for the next Take and re-signals Wake.
+func (events *SMSEvents) Take() []string {
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	devices := make([]string, 0, len(events.pending))
+	for deviceID := range events.pending {
+		devices = append(devices, deviceID)
+	}
+	clear(events.pending)
+	sort.Strings(devices)
+	return devices
+}
+
+// Add marks deviceID as having a pending arrival. It never blocks.
+func (events *SMSEvents) Add(deviceID string) {
+	events.mu.Lock()
+	events.pending[deviceID] = struct{}{}
+	events.mu.Unlock()
+	select {
+	case events.wake <- struct{}{}:
+	default:
+		// A wake-up is already pending; its Take will include this device.
+	}
+}
 
 // SubscribeSMSEvents subscribes to new-message indications (+CMTI, +CDSI and
-// direct +CMT/+CDS) from every modem AT session. The channel carries the
-// physical device ID and is only a wake-up signal; callers must list modem
-// storage. The subscription ends and the channel closes when ctx is done.
-func (manager *Manager) SubscribeSMSEvents(ctx context.Context) (<-chan string, error) {
+// direct +CMT/+CDS) from every modem AT session. Pending entries carry the
+// physical device ID and are only wake-up signals; callers must list modem
+// storage. The subscription ends and Wake closes when ctx is done.
+func (manager *Manager) SubscribeSMSEvents(ctx context.Context) (*SMSEvents, error) {
 	if manager == nil {
 		return nil, ErrNotStarted
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	events := make(chan string, smsEventBuffer)
+	events := NewSMSEvents()
 	manager.smsEventsMu.Lock()
 	if manager.smsEventSubscribers == nil {
-		manager.smsEventSubscribers = make(map[chan string]struct{})
+		manager.smsEventSubscribers = make(map[*SMSEvents]struct{})
 	}
 	manager.smsEventSubscribers[events] = struct{}{}
 	manager.smsEventsMu.Unlock()
@@ -43,7 +87,7 @@ func (manager *Manager) SubscribeSMSEvents(ctx context.Context) (<-chan string, 
 			defer manager.smsEventsMu.Unlock()
 			if _, ok := manager.smsEventSubscribers[events]; ok {
 				delete(manager.smsEventSubscribers, events)
-				close(events)
+				close(events.wake)
 			}
 		}()
 	}
@@ -55,10 +99,7 @@ func (manager *Manager) publishSMSEvent(deviceID string) {
 	manager.smsEventsMu.Lock()
 	defer manager.smsEventsMu.Unlock()
 	for events := range manager.smsEventSubscribers {
-		select {
-		case events <- deviceID:
-		default:
-		}
+		events.Add(deviceID)
 	}
 }
 

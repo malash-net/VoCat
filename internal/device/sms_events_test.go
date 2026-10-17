@@ -56,23 +56,52 @@ func TestManagerPublishesSMSArrivalURCs(t *testing.T) {
 
 	client.emit("+CEREG: 1")
 	select {
-	case got := <-events:
-		t.Fatalf("non-SMS URC published event for %q", got)
+	case <-events.Wake():
+		t.Fatalf("non-SMS URC published event for %q", events.Take())
 	default:
 	}
 	client.emit(`+CMTI: "SM",5`)
+	client.emit(`+CMTI: "SM",6`)
 	select {
-	case got := <-events:
-		if got != id {
-			t.Fatalf("event device = %q, want %q", got, id)
+	case <-events.Wake():
+		if got := events.Take(); len(got) != 1 || got[0] != id {
+			t.Fatalf("pending devices = %q, want [%q]", got, id)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("+CMTI did not publish an SMS event")
 	}
 
 	cancel()
-	if _, open := <-events; open {
-		t.Fatal("SMS event channel stayed open after cancellation")
+	if _, open := <-events.Wake(); open {
+		t.Fatal("SMS event wake channel stayed open after cancellation")
+	}
+}
+
+func TestSMSEventsCoalescePerDevice(t *testing.T) {
+	events := NewSMSEvents()
+	// The review scenario: a burst on A must not crowd out B's single arrival.
+	for range 16 {
+		events.Add("A")
+	}
+	events.Add("B")
+	<-events.Wake()
+	if got := events.Take(); strings.Join(got, ",") != "A,B" {
+		t.Fatalf("pending devices = %q, want [A B]", got)
+	}
+	select {
+	case <-events.Wake():
+		t.Fatalf("stale wake-up after Take, pending = %q", events.Take())
+	default:
+	}
+	// An arrival while the caller is scanning stays pending for the next pass.
+	events.Add("A")
+	select {
+	case <-events.Wake():
+	default:
+		t.Fatal("arrival after Take did not re-signal wake")
+	}
+	if got := events.Take(); strings.Join(got, ",") != "A" {
+		t.Fatalf("pending devices = %q, want [A]", got)
 	}
 }
 

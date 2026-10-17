@@ -51,7 +51,7 @@ type Manager struct {
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
 	smsEventsMu             sync.Mutex
-	smsEventSubscribers     map[chan string]struct{}
+	smsEventSubscribers     map[*SMSEvents]struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
