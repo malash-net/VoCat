@@ -1161,18 +1161,28 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case physicalID, ok := <-events:
+		case event, ok := <-events:
 			if !ok {
 				return
 			}
-			physicalID = strings.TrimSpace(physicalID)
-			if physicalID == "" {
+			for _, physicalID := range event.DeviceIDs {
+				physicalID = strings.TrimSpace(physicalID)
+				if physicalID == "" {
+					continue
+				}
+				pending[physicalID] = struct{}{}
+				if s.logger != nil {
+					s.logger.Debug("modem reported an inbound SMS indication",
+						"category", "sms", "event", "sms.arrival.indication", "physical_id", physicalID)
+				}
+			}
+			if len(event.DeviceIDs) == 0 {
 				continue
 			}
-			pending[physicalID] = struct{}{}
-			if s.logger != nil {
-				s.logger.Debug("modem reported an inbound SMS indication",
-					"category", "sms", "event", "sms.arrival.indication", "physical_id", physicalID)
+			if clearer, ok := source.(interface {
+				ClearSMSArrivalPending(<-chan device.SMSArrivalEvent)
+			}); ok {
+				clearer.ClearSMSArrivalPending(events)
 			}
 			if throttle == nil {
 				throttle = time.After(smsArrivalThrottle)

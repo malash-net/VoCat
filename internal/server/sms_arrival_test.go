@@ -103,7 +103,7 @@ func TestSMSArrivalEventBurstCoalesces(t *testing.T) {
 	}}
 	server := newSMSArrivalServer(t, controller.entry, controller)
 	upsertArrivalDevice(t, server, store.Device{ID: deviceID, Name: "EC20"})
-	events := make(chan string, 1)
+	events := make(chan device.SMSArrivalEvent, 1)
 	controller.smsEvents = events
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -111,7 +111,7 @@ func TestSMSArrivalEventBurstCoalesces(t *testing.T) {
 	go server.runSMSArrivalReconciler(ctx)
 
 	for index := 0; index < 20; index++ {
-		events <- deviceID
+		events <- device.SMSArrivalEvent{DeviceIDs: []string{deviceID}}
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for controller.listCalls() == 0 && time.Now().Before(deadline) {

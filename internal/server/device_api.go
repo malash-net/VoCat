@@ -76,7 +76,8 @@ type cellularDeviceLifecycleController interface {
 }
 
 type cellularSMSArrivalEventController interface {
-	SubscribeSMSArrivalEvents(context.Context) (<-chan string, error)
+	SubscribeSMSArrivalEvents(context.Context) (<-chan device.SMSArrivalEvent, error)
+	ClearSMSArrivalPending(<-chan device.SMSArrivalEvent)
 }
 
 type deviceConfigPayload struct {

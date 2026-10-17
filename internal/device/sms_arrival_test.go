@@ -41,12 +41,37 @@ func TestSMSArrivalEventPublishesDeviceID(t *testing.T) {
 	}
 	client.handler()
 	select {
-	case deviceID := <-events:
-		if deviceID != "physical-1" {
-			t.Fatalf("event device ID = %q, want physical-1", deviceID)
+	case event := <-events:
+		if len(event.DeviceIDs) != 1 || event.DeviceIDs[0] != "physical-1" {
+			t.Fatalf("event device IDs = %v, want [physical-1]", event.DeviceIDs)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("SMS arrival event was not published")
+	}
+}
+
+// Two devices signalling before the consumer reads must both be reported.
+func TestSMSArrivalEventKeepsEveryDevice(t *testing.T) {
+	manager := &Manager{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := manager.SubscribeSMSArrivalEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.publishSMSArrivalEvent("physical-b")
+	manager.publishSMSArrivalEvent("physical-c")
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case event := <-events:
+			for _, id := range event.DeviceIDs {
+				seen[id] = true
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only received %v; a device wake-up was lost", seen)
+		}
 	}
 }
 

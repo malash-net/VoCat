@@ -51,7 +51,7 @@ type Manager struct {
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
 	smsArrivalMu            sync.Mutex
-	smsArrivalSubscribers   map[chan string]struct{}
+	smsArrivalSubscribers   map[*smsArrivalListener]struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -183,7 +183,7 @@ func NewManager(options Options) (*Manager, error) {
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
-		smsArrivalSubscribers:         make(map[chan string]struct{}),
+		smsArrivalSubscribers:         make(map[*smsArrivalListener]struct{}),
 
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
