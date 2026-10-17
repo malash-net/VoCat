@@ -274,8 +274,6 @@ func TestManagerListReadAndDeleteSMS(t *testing.T) {
 	const ucs2PDU = "000405912143F5000842102030405000044F60597D"
 	client := &transcriptClient{steps: []clientStep{
 		{command: "AT+CMGF=0", response: okResponse()},
-		{command: "AT+CNMI?", response: okResponse("+CNMI: 0,0,0,2,1")},
-		{command: "AT+CNMI=2,1,0,2,1", response: okResponse()},
 		{command: `AT+CPMS="SM"`, response: okResponse("+CPMS: 2,40,0,23,2,40")},
 		{
 			command: "AT+CMGL=4",
@@ -289,6 +287,8 @@ func TestManagerListReadAndDeleteSMS(t *testing.T) {
 		{command: `AT+CPMS="ME"`, response: okResponse("+CPMS: 0,23,2,40,2,40")},
 		{command: "AT+CMGL=4", response: okResponse()},
 		{command: `AT+CPMS="SM"`, response: okResponse("+CPMS: 2,40,0,23,2,40")},
+		{command: "AT+CNMI?", response: okResponse("+CNMI: 0,0,0,2,1")},
+		{command: "AT+CNMI=2,1,0,2,1", response: okResponse()},
 		{command: "AT+CMGF=0", response: okResponse()},
 		{
 			command: "AT+CMGR=7",

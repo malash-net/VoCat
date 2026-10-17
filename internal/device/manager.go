@@ -140,7 +140,10 @@ type managedDevice struct {
 	discovered         bool
 	preFlightMode      *int
 	resetClientOnLock  bool
-	simPIN             string
+	// smsIndicationRetryAt backs off AT+CNMI configuration after a failure.
+	// Guarded by opMu.
+	smsIndicationRetryAt time.Time
+	simPIN               string
 }
 
 func NewManager(options Options) (*Manager, error) {

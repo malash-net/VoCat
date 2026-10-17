@@ -178,7 +178,6 @@ func (manager *Manager) ListSMS(
 		manager.setResult(id, state, nil, err)
 		return SMSListing{}, err
 	}
-	manager.ensureSMSIndications(ctx, client)
 	listing := SMSListing{}
 	var lastErr error
 	listed := false
@@ -225,6 +224,9 @@ func (manager *Manager) ListSMS(
 			listing.Storage.SM = area
 		}
 	}
+	// Configure arrival indications only after storage has been read, so an
+	// unresponsive or unsupported CNMI can never cost this scan its messages.
+	manager.ensureSMSIndications(ctx, state, client)
 	manager.setResult(id, state, nil, nil)
 	return listing, nil
 }

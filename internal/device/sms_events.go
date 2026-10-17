@@ -2,11 +2,17 @@ package device
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
+	"time"
 
 	"vocat/internal/modem"
 )
+
+// smsIndicationRetryDelay keeps a modem that rejects or ignores AT+CNMI from
+// stalling its AT port on every storage scan.
+const smsIndicationRetryDelay = 10 * time.Minute
 
 // smsEventBuffer lets a burst of arrivals on several modems queue one wake-up
 // per modem; further arrivals are coalesced because a sync reads all storage.
@@ -85,10 +91,23 @@ func isSMSArrivalURC(line string) bool {
 // because firmware can reset CNMI after a reboot, CFUN cycle or profile
 // switch. <bm>, <ds> and <bfr> are preserved so cell broadcast and delivery
 // report routing stay as configured. Failures are not fatal: periodic storage
-// scans still find the messages, just later.
-func (manager *Manager) ensureSMSIndications(ctx context.Context, client modem.Client) {
-	response, err := manager.command(ctx, client, "AT+CNMI?")
+// scans still find the messages, just later. Each command gets its own short
+// budget instead of the caller's scan deadline, and a failure backs off so a
+// timed-out command does not hold the AT session on every scan. The caller
+// must hold state.opMu.
+func (manager *Manager) ensureSMSIndications(ctx context.Context, state *managedDevice, client modem.Client) {
+	now := time.Now()
+	if now.Before(state.smsIndicationRetryAt) {
+		return
+	}
+	command := func(text string) (modem.Response, error) {
+		commandCtx, cancel := context.WithTimeout(ctx, manager.commandTimeout)
+		defer cancel()
+		return manager.command(commandCtx, client, text)
+	}
+	response, err := command("AT+CNMI?")
 	if err != nil {
+		state.smsIndicationRetryAt = now.Add(smsIndicationRetryDelay)
 		return
 	}
 	values, ok := parseCNMI(response)
@@ -103,8 +122,14 @@ func (manager *Manager) ensureSMSIndications(ctx context.Context, client modem.C
 	for index, value := range values {
 		parts[index] = strconv.Itoa(value)
 	}
-	if _, err := manager.command(ctx, client, "AT+CNMI="+strings.Join(parts, ",")); err != nil {
-		_, _ = manager.command(ctx, client, "AT+CNMI=2,1")
+	if _, err := command("AT+CNMI=" + strings.Join(parts, ",")); err != nil {
+		if errors.Is(err, modem.ErrCommandTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			state.smsIndicationRetryAt = now.Add(smsIndicationRetryDelay)
+			return
+		}
+		if _, err := command("AT+CNMI=2,1"); err != nil {
+			state.smsIndicationRetryAt = now.Add(smsIndicationRetryDelay)
+		}
 	}
 }
 
