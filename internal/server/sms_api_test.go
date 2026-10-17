@@ -865,3 +865,68 @@ func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestSyncModemSMSKeepsIncompleteMultipartSegmentsUntilMerged(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	segment := func(index, sequence int, body string) device.SMSMessage {
+		return device.SMSMessage{
+			Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+			Direction: device.SMSDirectionReceived, From: "+447700900123", Text: body,
+			Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &receivedAt,
+			Concat: &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: sequence},
+			RawPDU: "SM-" + body,
+		}
+	}
+	controller := &smsDeletionController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{
+			ID: deviceID, Discovered: true,
+			Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
+		}},
+		storedMessages: []device.SMSMessage{segment(3, 1, "part one ")},
+	}
+	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
+
+	// An arrival-triggered scan can run before the second segment is stored.
+	server.syncModemSMS(ctx, deviceID)
+	controller.mu.Lock()
+	deleted := append([]string(nil), controller.deleted...)
+	controller.storedMessages = append(controller.storedMessages, segment(4, 2, "part two"))
+	controller.mu.Unlock()
+	if len(deleted) != 0 {
+		t.Fatalf("incomplete multipart segment was cleared: %v", deleted)
+	}
+
+	server.syncModemSMS(ctx, deviceID)
+	controller.mu.Lock()
+	remaining := len(controller.storedMessages)
+	deleted = append([]string(nil), controller.deleted...)
+	controller.mu.Unlock()
+	sort.Strings(deleted)
+	if remaining != 0 || strings.Join(deleted, ",") != "SM:3,SM:4" {
+		t.Fatalf("remaining = %d, deleted = %v", remaining, deleted)
+	}
+	stored, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Body != "part one part two" ||
+		!store.ConcatSMSReadyToNotify(stored[0].MessageID, stored[0].Extra) {
+		t.Fatalf("stored messages = %#v", stored)
+	}
+}

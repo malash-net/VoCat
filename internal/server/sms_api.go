@@ -722,6 +722,12 @@ func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical s
 		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
+		// Multipart groups are keyed by the slot of their first segment as seen
+		// in this scan, so deleting a segment before the row is complete would
+		// give later segments a different message ID and leave both halves
+		// unmerged forever. Hold every segment until its row is complete.
+		concatSlots := make(map[string][]modemSMSSlot)
+		concatComplete := make(map[string]bool)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -804,7 +810,12 @@ func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical s
 				continue
 			}
 			if autoClear {
-				clearSlots = appendModemSMSSlot(clearSlots, message)
+				if message.Concat != nil && message.Concat.Total > 1 {
+					concatSlots[messageID] = appendModemSMSSlot(concatSlots[messageID], message)
+					concatComplete[messageID] = store.ConcatSMSReadyToNotify(saveResult.Message.MessageID, saveResult.Message.Extra)
+				} else {
+					clearSlots = appendModemSMSSlot(clearSlots, message)
+				}
 			}
 			if saved := saveResult.Message; saveResult.Inserted && saved.Direction == "inbound" &&
 				store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra) {
@@ -817,6 +828,11 @@ func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical s
 			}
 		}
 		if autoClear {
+			for messageID, slots := range concatSlots {
+				if concatComplete[messageID] {
+					clearSlots = append(clearSlots, slots...)
+				}
+			}
 			s.clearPersistedModemSMS(ctx, physicalID, config.ID, clearSlots)
 		}
 	}
