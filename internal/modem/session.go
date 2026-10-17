@@ -314,9 +314,10 @@ func (session *Session) sniffSMSArrival(data []byte) {
 	if bytes.Contains(bytes.ToLower(scanned), smsIndicationNeedle) {
 		(*handler)()
 	}
-	// Keep a tail shorter than the indication so a split match can complete.
-	tail := min(len(data), len(smsIndicationNeedle)-1)
-	session.smsScanTail = append(session.smsScanTail[:0], data[len(data)-tail:]...)
+	// Keep the tail of what was actually scanned, not of this read alone, so a
+	// prefix spread over several short reads still accumulates.
+	tail := min(len(scanned), len(smsIndicationNeedle)-1)
+	session.smsScanTail = append(session.smsScanTail[:0], scanned[len(scanned)-tail:]...)
 }
 
 func (session *Session) receivePendingLocked() {

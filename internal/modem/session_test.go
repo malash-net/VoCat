@@ -354,19 +354,31 @@ func TestSessionSMSArrivalHandlerFiresOnIdleIndication(t *testing.T) {
 }
 
 func TestSessionSMSArrivalHandlerMatchesSplitIndication(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		session := newTestSession(t, &transcriptTransport{})
-		fired := make(chan struct{}, 1)
-		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
-		// The prefix straddles a read boundary, so detection uses the tail.
-		transportForSession(t, session).enqueue("\r\n+CM", "TI: \"SM\",7\r\n")
-		synctest.Wait()
-		select {
-		case <-fired:
-		default:
-			t.Fatal("split +CMTI was not detected")
-		}
-	})
+	for _, test := range []struct {
+		name   string
+		chunks []string
+	}{
+		{"two reads", []string{"\r\n+CM", "TI: \"SM\",7\r\n"}},
+		// Short reads are legal on a serial port; the prefix may span more than
+		// two of them.
+		{"three reads", []string{"+C", "MT", "I: \"SM\",7\r\n"}},
+		{"byte at a time", []string{"+", "C", "M", "T", "I", ":", " \"SM\",7\r\n"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				session := newTestSession(t, &transcriptTransport{})
+				fired := make(chan struct{}, 1)
+				session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+				transportForSession(t, session).enqueue(test.chunks...)
+				synctest.Wait()
+				select {
+				case <-fired:
+				default:
+					t.Fatal("split +CMTI was not detected")
+				}
+			})
+		})
+	}
 }
 
 // Sniffing must not disturb a command's response, and the indication must
