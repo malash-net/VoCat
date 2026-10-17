@@ -59,9 +59,14 @@ type Session struct {
 	cancel    context.CancelFunc
 	received  chan atRead
 	readDone  chan struct{}
+	idleReady chan struct{}
+	idleDone  chan struct{}
 	ioDone    chan error
 	closeOnce sync.Once
 	closeErr  error
+
+	smsHandlerMu sync.RWMutex
+	smsHandler   func()
 }
 
 type atRead struct {
@@ -96,8 +101,10 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 		transport: transport, options: options,
 		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
 		received: make(chan atRead, 8), readDone: make(chan struct{}),
+		idleReady: make(chan struct{}, 1), idleDone: make(chan struct{}),
 	}
 	go session.readLoop()
+	go session.consumeIdleInput()
 	return session, nil
 }
 
@@ -257,12 +264,14 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 func (session *Session) readLoop() {
 	defer close(session.readDone)
 	buffer := make([]byte, 1024)
+	var indications smsIndicationObserver
 	for session.lifetime.Err() == nil {
 		count, err := session.transport.Read(buffer)
 		if count == 0 && (err == nil || errors.Is(err, syscall.EINTR)) {
 			continue
 		}
 		batch := atRead{data: append([]byte(nil), buffer[:max(count, 0)]...), err: err}
+		indications.observe(batch.data, session.notifySMSReceived)
 		if err != nil {
 			session.poisoned.Store(true)
 		}
@@ -271,7 +280,76 @@ func (session *Session) readLoop() {
 		case <-session.lifetime.Done():
 			return
 		}
+		session.wakeIdleInput()
 		if err != nil {
+			return
+		}
+	}
+}
+
+func (session *Session) wakeIdleInput() {
+	select {
+	case session.idleReady <- struct{}{}:
+	default:
+	}
+}
+
+// Drain idle input so unsolicited traffic cannot fill received and stop the
+// reader before it sees a new SMS indication. The gate protects active callers;
+// abandoned replies use the same parser, without waiting for more input.
+func (session *Session) consumeIdleInput() {
+	defer close(session.idleDone)
+	for {
+		select {
+		case <-session.idleReady:
+		case <-session.lifetime.Done():
+			return
+		}
+		if err := session.lock(session.lifetime); err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(session.lifetime, session.options.CommandTimeout)
+		session.drainIdleInputLocked(ctx)
+		cancel()
+		session.unlock()
+	}
+}
+
+func (session *Session) drainIdleInputLocked(ctx context.Context) {
+	if session.ioDone != nil {
+		select {
+		case err := <-session.ioDone:
+			session.ioDone = nil
+			if err != nil {
+				return
+			}
+		default:
+			return
+		}
+	}
+	for batches := 0; ; batches++ {
+		for {
+			if ctx.Err() != nil || session.Poisoned() {
+				return
+			}
+			consumed, err := session.consumeBufferedLocked(ctx, nil, nil)
+			if err != nil {
+				return
+			}
+			if !consumed {
+				break
+			}
+		}
+		// Keep idle buffering and each gate acquisition bounded. An oversized
+		// partial line remains owned by the normal transaction recovery path.
+		if batches >= cap(session.received) || len(session.readBuf) >= 64*1024 {
+			return
+		}
+		select {
+		case batch := <-session.received:
+			session.readBuf = append(session.readBuf, batch.data...)
+			session.readErr = batch.err
+		default:
 			return
 		}
 	}
@@ -304,6 +382,8 @@ func (session *Session) runIOLocked(ctx context.Context, operation func() error)
 			session.poisoned.Store(true)
 		}
 		done <- err
+		// A canceled caller may have left completed I/O and received data behind.
+		session.wakeIdleInput()
 	}()
 	return session.waitIOLocked(ctx)
 }
@@ -349,24 +429,8 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if session.skipSpace && len(session.readBuf) > 0 {
-			session.skipSpace = false
-			if session.readBuf[0] == ' ' {
-				session.readBuf = session.readBuf[1:]
-				continue
-			}
-		}
-		if session.pending != nil && session.pending.awaitPrompt && len(session.readBuf) > 0 && session.readBuf[0] == '>' {
-			session.readBuf = session.readBuf[1:]
-			session.skipSpace = true
-			return session.sendPayloadLocked(ctx, response != nil, payload)
-		}
-		if line, ok := popLine(&session.readBuf); ok {
-			if session.pending == nil {
-				session.recoveryDeadline = time.Time{}
-			}
-			session.consumeLineLocked(line, response)
-			return nil
+		if consumed, err := session.consumeBufferedLocked(ctx, response, payload); consumed || err != nil {
+			return err
 		}
 		if session.readErr != nil {
 			session.poisoned.Store(true)
@@ -392,6 +456,28 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 			return ErrSessionClosed
 		}
 	}
+}
+
+func (session *Session) consumeBufferedLocked(ctx context.Context, response *Response, payload []byte) (bool, error) {
+	if session.skipSpace && len(session.readBuf) > 0 {
+		session.skipSpace = false
+		if session.readBuf[0] == ' ' {
+			session.readBuf = session.readBuf[1:]
+		}
+	}
+	if session.pending != nil && session.pending.awaitPrompt && len(session.readBuf) > 0 && session.readBuf[0] == '>' {
+		session.readBuf = session.readBuf[1:]
+		session.skipSpace = true
+		return true, session.sendPayloadLocked(ctx, response != nil, payload)
+	}
+	if line, ok := popLine(&session.readBuf); ok {
+		if session.pending == nil {
+			session.recoveryDeadline = time.Time{}
+		}
+		session.consumeLineLocked(line, response)
+		return true, nil
+	}
+	return false, nil
 }
 
 func (session *Session) sendPayloadLocked(ctx context.Context, active bool, payload []byte) error {
@@ -652,6 +738,7 @@ func (session *Session) Close() error {
 		session.closeErr = session.transport.Close()
 	})
 	<-session.readDone
+	<-session.idleDone
 	session.gate <- struct{}{}
 	defer session.unlock()
 	if session.ioDone != nil {

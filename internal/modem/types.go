@@ -113,6 +113,14 @@ type Client interface {
 	Close() error
 }
 
+// SMSNotificationClient observes stored-message indications without consuming
+// the URCs used by Execute or WaitURC. The handler must not block or issue AT
+// commands; it is only a wake-up signal and stops being called after Close.
+// Passing nil removes the handler.
+type SMSNotificationClient interface {
+	SetSMSNotificationHandler(func())
+}
+
 // PromptClient performs the two-phase interaction used by AT+CMGS. The
 // implementation must hold the same command serialization lock while waiting
 // for the prompt, writing payload+Ctrl-Z, and reading the final result.
