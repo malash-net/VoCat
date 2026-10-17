@@ -52,9 +52,10 @@ type Session struct {
 	pending   *atTransaction
 	poisoned  atomic.Bool
 	busy      atomic.Bool
-	// idleBuf holds bytes read while nobody consumed received. Only readLoop
-	// appends; the transaction start drains it under the gate.
+	// idleMu guards idle and idleBuf. idle is closed and replaced whenever busy
+	// drops, waking a readLoop parked in the blocking send.
 	idleMu  sync.Mutex
+	idle    chan struct{}
 	idleBuf []byte
 
 	// See SetSMSArrivalHandler.
@@ -107,6 +108,7 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 		transport: transport, options: options,
 		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
 		received: make(chan atRead, 8), readDone: make(chan struct{}),
+		idle: make(chan struct{}),
 	}
 	go session.readLoop()
 	return session, nil
@@ -204,12 +206,10 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	// Never assign an old reply (including idle input and partial trailing
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
 	session.drainIdleLocked()
-	session.busy.Store(true)
-	defer func() {
-		if session.pending == nil {
-			session.busy.Store(false)
-		}
-	}()
+	session.setBusy(true)
+	// The caller leaves here even when a timed-out transaction is still pending;
+	// the next command's flush loop resolves it. Nobody is reading until then.
+	defer session.setBusy(false)
 	for {
 		session.receivePendingLocked()
 		if session.pending == nil {
@@ -232,7 +232,7 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 		command: command, responsePrefix: expectedResponsePrefix(command), awaitPrompt: interactive,
 	}
 	session.pending = transaction
-	session.busy.Store(true)
+	session.setBusy(true)
 	// Cancellation does not stop the modem. Preserve the caller's deadline and
 	// allow known long commands to finish even when it was shorter than usual.
 	deadline, _ := ctx.Deadline()
@@ -289,21 +289,18 @@ func (session *Session) readLoop() {
 			session.poisoned.Store(true)
 		}
 		if session.busy.Load() {
+			// Re-check on idle: a transaction that timed out leaves nobody
+			// reading, so parking here would stop the port for good.
+			idle := session.idleSignal()
 			select {
 			case session.received <- batch:
+			case <-idle:
+				session.bufferIdle(batch.data)
 			case <-session.lifetime.Done():
 				return
 			}
 		} else {
-			// Nobody drains received while idle, so blocking would stop reading
-			// the port. Keep the bytes: dropping them loses partial lines and
-			// URCs a later command or WaitURC still needs.
-			session.idleMu.Lock()
-			session.idleBuf = append(session.idleBuf, batch.data...)
-			if len(session.idleBuf) > maxIdleBuffer {
-				session.idleBuf = session.idleBuf[len(session.idleBuf)-maxIdleBuffer:]
-			}
-			session.idleMu.Unlock()
+			session.bufferIdle(batch.data)
 		}
 		if err != nil {
 			return
@@ -349,6 +346,27 @@ func (session *Session) sniffSMSArrival(data []byte) {
 // Idle traffic is unsolicited, so an unbounded buffer would grow forever.
 const maxIdleBuffer = 64 << 10
 
+// setBusy records whether a reader is draining received. Dropping to idle wakes
+// a readLoop already parked in the blocking send, which would otherwise never
+// re-check the flag.
+func (session *Session) setBusy(busy bool) {
+	session.busy.Store(busy)
+	if busy {
+		return
+	}
+	session.idleMu.Lock()
+	close(session.idle)
+	session.idle = make(chan struct{})
+	session.idleMu.Unlock()
+}
+
+// idleSignal returns the channel closed when the session next goes idle.
+func (session *Session) idleSignal() <-chan struct{} {
+	session.idleMu.Lock()
+	defer session.idleMu.Unlock()
+	return session.idle
+}
+
 func (session *Session) receivePendingLocked() {
 	for {
 		select {
@@ -359,6 +377,15 @@ func (session *Session) receivePendingLocked() {
 			return
 		}
 	}
+}
+
+func (session *Session) bufferIdle(data []byte) {
+	session.idleMu.Lock()
+	session.idleBuf = append(session.idleBuf, data...)
+	if len(session.idleBuf) > maxIdleBuffer {
+		session.idleBuf = session.idleBuf[len(session.idleBuf)-maxIdleBuffer:]
+	}
+	session.idleMu.Unlock()
 }
 
 // drainIdleLocked folds bytes read while idle into the command buffer, keeping
@@ -536,7 +563,7 @@ func (session *Session) consumeLineLocked(line string, response *Response) {
 	pending.remainingEcho = nil
 	if isFinalResult(line) || callResult {
 		session.pending = nil
-		session.busy.Store(false)
+		session.setBusy(false)
 		session.recoveryDeadline = time.Time{}
 		if response != nil {
 			response.Final = line
@@ -562,8 +589,8 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 	if session.Poisoned() {
 		return "", ErrSessionClosed
 	}
-	session.busy.Store(true)
-	defer session.busy.Store(false)
+	session.setBusy(true)
+	defer session.setBusy(false)
 	session.drainIdleLocked()
 	for {
 		for index, line := range session.urcs {
