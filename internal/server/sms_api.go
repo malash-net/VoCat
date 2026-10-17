@@ -638,10 +638,25 @@ func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"deleted": true}})
 }
 
+// syncModemSMS retains the configured-device ID filter used by existing callers.
 func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
+	s.syncModemSMSFiltered(ctx, onlyDevice, nil)
+}
+
+// syncModemSMSPhysical resolves event IDs against the latest physical mapping
+// under smsSyncMu, visiting every associated configuration in the usual order.
+func (s *Server) syncModemSMSPhysical(ctx context.Context, physicalIDs map[string]struct{}) {
+	s.syncModemSMSFiltered(ctx, "", physicalIDs)
+}
+
+func (s *Server) syncModemSMSFiltered(ctx context.Context, onlyDevice string, physicalIDs map[string]struct{}) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.smsSyncMu.Lock()
 	defer s.smsSyncMu.Unlock()
-	if s.devices == nil {
+	// A queued scan may have waited behind an API operation or profile switch.
+	if ctx.Err() != nil || s.devices == nil {
 		return
 	}
 	configs, err := s.store.ListDevices(ctx)
@@ -650,6 +665,9 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		return
 	}
 	for _, config := range configs {
+		if ctx.Err() != nil {
+			return
+		}
 		if onlyDevice != "" && config.ID != onlyDevice {
 			continue
 		}
@@ -681,17 +699,25 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		if !present {
 			continue
 		}
-		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
-		// OpenStick 410 controls cellular registration through QMI but receives
-		// stored SMS through its AT port. Its firmware can reset CNMI after a
-		// profile switch, leaving newly delivered SMS invisible to VoCat.
-		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
-			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
-			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
-			cancelSetup()
-			if setupErr != nil {
-				s.logger.Debug("OpenStick 410 cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
+		if physicalIDs != nil {
+			if _, wanted := physicalIDs[physicalID]; !wanted {
+				continue
 			}
+		}
+		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
+		// Reapply storage notifications after reconnects/profile switches, which
+		// can reset CNMI. Unsupported firmware must still get the periodic scan.
+		if ctx.Err() != nil {
+			return
+		}
+		setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
+		_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
+		cancelSetup()
+		if setupErr != nil {
+			s.logger.Debug("cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		listContext, cancelList := context.WithTimeout(ctx, 30*time.Second)
 		listing, err := s.devices.ListSMS(listContext, physicalID)
@@ -724,6 +750,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
+		clearGroups := make(map[string]*modemSMSClearGroup)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -766,6 +793,15 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				direction = "outbound"
 			}
 			messageID := modemSMSMessageID(message, modemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
+			var clearGroup *modemSMSClearGroup
+			if autoClear && message.Concat != nil && message.Concat.Total > 1 {
+				clearGroup = clearGroups[messageID]
+				if clearGroup == nil {
+					clearGroup = &modemSMSClearGroup{}
+					clearGroups[messageID] = clearGroup
+				}
+				clearGroup.slots = appendModemSMSSlot(clearGroup.slots, message)
+			}
 			extra, _ := json.Marshal(map[string]any{
 				"modem_index":        message.Index,
 				"storage":            message.Storage,
@@ -802,10 +838,15 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				Extra:         extra,
 			})
 			if saveErr != nil {
+				if clearGroup != nil {
+					clearGroup.failed = true
+				}
 				s.logger.Warn("persist modem SMS failed", "category", "sms", "device_id", config.ID, "raw_error", saveErr)
 				continue
 			}
-			if autoClear {
+			if clearGroup != nil {
+				clearGroup.complete = store.ConcatSMSReadyToNotify(saveResult.Message.MessageID, saveResult.Message.Extra)
+			} else if autoClear {
 				clearSlots = appendModemSMSSlot(clearSlots, message)
 			}
 			if saved := saveResult.Message; saveResult.Inserted && saved.Direction == "inbound" &&
@@ -819,9 +860,24 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			}
 		}
 		if autoClear {
+			// The first segment's slot anchors the multipart message ID. Retain
+			// every segment until the group is durably complete, so a later event
+			// (or a process restart) still resolves the same group. Decide after
+			// all saves so the completing scan can clear the entire group at once.
+			for _, group := range clearGroups {
+				if group.complete && !group.failed {
+					clearSlots = append(clearSlots, group.slots...)
+				}
+			}
 			s.clearPersistedModemSMS(ctx, physicalID, config.ID, clearSlots)
 		}
 	}
+}
+
+type modemSMSClearGroup struct {
+	slots    []modemSMSSlot
+	complete bool
+	failed   bool
 }
 
 type modemSMSSlot struct {
@@ -857,6 +913,9 @@ func (s *Server) clearPersistedModemSMS(ctx context.Context, physicalID, configI
 	}
 	sortModemSMSSlotsDescending(slots)
 	for _, slot := range slots {
+		if ctx.Err() != nil {
+			return
+		}
 		deleteContext, cancelDelete := context.WithTimeout(ctx, 10*time.Second)
 		err := s.devices.DeleteSMSFromStorage(deleteContext, physicalID, slot.storage, slot.index)
 		cancelDelete()
@@ -1096,26 +1155,6 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 		return false
 	default:
 		return true
-	}
-}
-
-// StartSMSSyncLoop periodically persists inbound cellular SMS even when no
-// client has the SMS page open. The first tick is delayed so startup SIM/AKA
-// work gets exclusive use of the modem. Stable VoWiFi sessions still scan SM
-// and ME as a catch-up path for messages delivered while the card was offline.
-func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = 15 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.syncModemSMS(ctx, "")
-		}
 	}
 }
 
