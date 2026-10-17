@@ -409,43 +409,56 @@ func TestSessionSMSArrivalHandlerKeepsTransactionIntact(t *testing.T) {
 	})
 }
 
-// Bytes read while idle must be retained: a partial line whose tail is dropped
-// would make the next command wait for it forever.
-// A timed-out command leaves nobody reading, so readLoop must not stay parked
-// in the blocking send once the session goes idle.
-func TestSessionKeepsReadingAfterTimedOutCommand(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		transport := &transcriptTransport{steps: []transportStep{
-			{write: "AT+CSQ\r", chunks: []string{}},
-		}}
-		session := newTestSession(t, transport)
-		fired := make(chan struct{}, 1)
-		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+// readLoop must keep draining the port when nothing consumes the queue: both
+// while plain idle and after a timed-out command left the caller behind.
+func TestSessionKeepsReadingWithoutConsumer(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		steps  []transportStep
+		settle func(*testing.T, *Session)
+	}{
+		{name: "idle", settle: func(*testing.T, *Session) {}},
+		{
+			name:  "after timed-out command",
+			steps: []transportStep{{write: "AT+CSQ\r", chunks: []string{}}},
+			settle: func(t *testing.T, session *Session) {
+				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				if _, err := session.Execute(ctx, "AT+CSQ"); err == nil {
+					t.Fatal("command unexpectedly succeeded")
+				}
+				if session.busy.Load() {
+					t.Fatal("session stayed busy after the caller left")
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				transport := &transcriptTransport{steps: test.steps}
+				session := newTestSession(t, transport)
+				fired := make(chan struct{}, 1)
+				session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+				test.settle(t, session)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_, err := session.Execute(ctx, "AT+CSQ")
-		cancel()
-		if err == nil {
-			t.Fatal("command unexpectedly succeeded")
-		}
-		if session.busy.Load() {
-			t.Fatal("session stayed busy after the caller left")
-		}
-
-		for index := 0; index < 64; index++ {
-			transport.enqueue("+CREG: 0,1\r\n")
-		}
-		synctest.Wait()
-		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
-		synctest.Wait()
-		select {
-		case <-fired:
-		default:
-			t.Fatal("readLoop stopped after a timed-out command")
-		}
-	})
+				for index := 0; index < 64; index++ {
+					transport.enqueue("+CREG: 0,1\r\n")
+				}
+				synctest.Wait()
+				transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+				synctest.Wait()
+				select {
+				case <-fired:
+				default:
+					t.Fatal("readLoop stopped reading the port")
+				}
+			})
+		})
+	}
 }
 
+// Idle bytes must be retained: a partial line whose tail is dropped would make
+// the next command wait for it forever.
 func TestSessionIdleBytesAreRetained(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		transport := &transcriptTransport{}
@@ -461,26 +474,6 @@ func TestSessionIdleBytesAreRetained(t *testing.T) {
 		session.idleMu.Unlock()
 		if !strings.Contains(idle, "+CUSD: 0,") {
 			t.Fatalf("idle bytes were dropped: %q", idle)
-		}
-	})
-}
-
-func TestSessionSMSArrivalHandlerSurvivesIdleBacklog(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		session := newTestSession(t, &transcriptTransport{})
-		fired := make(chan struct{}, 1)
-		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
-		transport := transportForSession(t, session)
-		for index := 0; index < 32; index++ {
-			transport.enqueue("\r\n+CREG: 0,1\r\n")
-		}
-		synctest.Wait()
-		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
-		synctest.Wait()
-		select {
-		case <-fired:
-		default:
-			t.Fatal("idle backlog stopped the read loop before +CMTI")
 		}
 	})
 }

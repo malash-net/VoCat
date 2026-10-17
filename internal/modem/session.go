@@ -52,17 +52,12 @@ type Session struct {
 	pending   *atTransaction
 	poisoned  atomic.Bool
 	busy      atomic.Bool
-	// idleMu guards idle and idleBuf. idle is closed and replaced whenever busy
-	// drops, waking a readLoop parked in the blocking send.
 	idleMu  sync.Mutex
 	idle    chan struct{}
 	idleBuf []byte
 
-	// See SetSMSArrivalHandler.
 	smsArrivalHandler atomic.Pointer[func()]
-	// Trailing bytes of the previous read, for indications split across reads.
-	// Only readLoop touches it, so it needs no lock.
-	smsScanTail []byte
+	smsScanTail       []byte
 
 	recoveryDeadline time.Time
 	ioDeadline       time.Time
@@ -207,8 +202,6 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
 	session.drainIdleLocked()
 	session.setBusy(true)
-	// The caller leaves here even when a timed-out transaction is still pending;
-	// the next command's flush loop resolves it. Nobody is reading until then.
 	defer session.setBusy(false)
 	for {
 		session.receivePendingLocked()
@@ -282,15 +275,11 @@ func (session *Session) readLoop() {
 			continue
 		}
 		batch := atRead{data: append([]byte(nil), buffer[:max(count, 0)]...), err: err}
-		// Sniff before the channel send below, which may block when the
-		// consumer is idle.
 		session.sniffSMSArrival(batch.data)
 		if err != nil {
 			session.poisoned.Store(true)
 		}
 		if session.busy.Load() {
-			// Re-check on idle: a transaction that timed out leaves nobody
-			// reading, so parking here would stop the port for good.
 			idle := session.idleSignal()
 			select {
 			case session.received <- batch:
@@ -309,9 +298,8 @@ func (session *Session) readLoop() {
 }
 
 // SetSMSArrivalHandler registers a callback invoked when the raw byte stream
-// carries a new-SMS indication. An idle session never parses URCs, so without
-// this a modem's +CMTI waits for the next periodic scan. The handler runs on
-// the read goroutine and must not block.
+// carries a new-SMS indication. The handler runs on the read goroutine and must
+// not block.
 func (session *Session) SetSMSArrivalHandler(handler func()) {
 	if handler == nil {
 		session.smsArrivalHandler.Store(nil)
@@ -321,9 +309,7 @@ func (session *Session) SetSMSArrivalHandler(handler func()) {
 }
 
 // sniffSMSArrival scans one raw read for a new-SMS indication. It touches
-// neither the gate, the pending transaction, nor the read buffer, so it cannot
-// disturb AT response framing; a false positive only costs an idempotent
-// rescan.
+// neither the gate, the pending transaction, nor the read buffer.
 func (session *Session) sniffSMSArrival(data []byte) {
 	handler := session.smsArrivalHandler.Load()
 	if handler == nil {
@@ -336,8 +322,7 @@ func (session *Session) sniffSMSArrival(data []byte) {
 	if bytes.Contains(bytes.ToLower(scanned), smsIndicationNeedle) {
 		(*handler)()
 	}
-	// Keep the tail of what was actually scanned, not of this read alone, so a
-	// prefix spread over several short reads still accumulates.
+	// Keep the tail of what was scanned, not of this read alone.
 	tail := min(len(scanned), len(smsIndicationNeedle)-1)
 	session.smsScanTail = append(session.smsScanTail[:0], scanned[len(scanned)-tail:]...)
 }
