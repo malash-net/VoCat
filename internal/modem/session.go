@@ -52,9 +52,9 @@ type Session struct {
 	pending   *atTransaction
 	poisoned  atomic.Bool
 	busy      atomic.Bool
-	idleMu  sync.Mutex
-	idle    chan struct{}
-	idleBuf []byte
+	idleMu    sync.Mutex
+	idle      chan struct{}
+	idleBuf   []byte
 
 	smsArrivalHandler atomic.Pointer[func()]
 	smsScanTail       []byte

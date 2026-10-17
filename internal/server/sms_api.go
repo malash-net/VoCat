@@ -1119,13 +1119,11 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// smsArrivalThrottle groups a burst of indications — the segments of one long
-// message, or several messages landing together — into a single storage scan.
 const smsArrivalThrottle = 300 * time.Millisecond
 
 // StartSMSArrivalReconciler persists inbound cellular SMS as soon as the modem
-// reports one, instead of waiting for the next periodic scan. StartSMSSyncLoop
-// remains the safety net for firmware that never signals.
+// reports one. StartSMSSyncLoop remains the safety net for firmware that never
+// signals.
 func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
 	if s == nil {
 		return
@@ -1150,11 +1148,9 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 		}
 		return
 	}
-	// A nil channel would block this goroutine forever.
 	if events == nil {
 		return
 	}
-	// Indications arriving while the throttle runs accumulate into one scan.
 	pending := make(map[string]struct{})
 	var throttle <-chan time.Time
 	for {
@@ -1179,11 +1175,7 @@ func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
 			if len(event.DeviceIDs) == 0 {
 				continue
 			}
-			if clearer, ok := source.(interface {
-				ClearSMSArrivalPending(<-chan device.SMSArrivalEvent)
-			}); ok {
-				clearer.ClearSMSArrivalPending(events)
-			}
+			source.ClearSMSArrivalPending(events)
 			if throttle == nil {
 				throttle = time.After(smsArrivalThrottle)
 			}

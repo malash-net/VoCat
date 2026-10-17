@@ -242,8 +242,8 @@ func (manager *Manager) publishSMSArrivalEvent(deviceID string) {
 	}
 }
 
-// ClearSMSArrivalPending drops devices the consumer has just processed, so the
-// set does not grow without bound.
+// ClearSMSArrivalPending drops devices the consumer has processed, so the set
+// does not grow without bound.
 func (manager *Manager) ClearSMSArrivalPending(events <-chan SMSArrivalEvent) {
 	manager.smsArrivalMu.Lock()
 	defer manager.smsArrivalMu.Unlock()
