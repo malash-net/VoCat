@@ -55,6 +55,7 @@ type Session struct {
 	idleMu    sync.Mutex
 	idle      chan struct{}
 	idleBuf   []byte
+	idleData  chan struct{}
 
 	smsArrivalHandler atomic.Pointer[func()]
 	smsScanTail       []byte
@@ -103,7 +104,7 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 		transport: transport, options: options,
 		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
 		received: make(chan atRead, 8), readDone: make(chan struct{}),
-		idle: make(chan struct{}),
+		idle: make(chan struct{}), idleData: make(chan struct{}, 1),
 	}
 	go session.readLoop()
 	return session, nil
@@ -371,6 +372,11 @@ func (session *Session) bufferIdle(data []byte) {
 	if len(session.idleBuf) > maxIdleBuffer {
 		session.idleBuf = session.idleBuf[len(session.idleBuf)-maxIdleBuffer:]
 	}
+	// Wake a reader parked in readNextLocked so it picks these bytes up.
+	select {
+	case session.idleData <- struct{}{}:
+	default:
+	}
 	session.idleMu.Unlock()
 }
 
@@ -444,6 +450,10 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// readLoop only feeds received while busy, so anything buffered while
+		// idle must be picked up here or this loop waits on a line that already
+		// arrived.
+		session.drainIdleLocked()
 		if session.skipSpace && len(session.readBuf) > 0 {
 			session.skipSpace = false
 			if session.readBuf[0] == ' ' {
@@ -479,6 +489,8 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 		case batch := <-session.received:
 			session.readBuf = append(session.readBuf, batch.data...)
 			session.readErr = batch.err
+		case <-session.idleData:
+			continue
 		case <-ctx.Done():
 			continue
 		case <-recovery:
