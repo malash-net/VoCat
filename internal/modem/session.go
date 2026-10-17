@@ -51,6 +51,7 @@ type Session struct {
 	urcs      []string
 	pending   *atTransaction
 	poisoned  atomic.Bool
+	onURC     atomic.Pointer[func(string)]
 
 	recoveryDeadline time.Time
 	ioDeadline       time.Time
@@ -58,6 +59,7 @@ type Session struct {
 	lifetime  context.Context
 	cancel    context.CancelFunc
 	received  chan atRead
+	readWake  chan struct{}
 	readDone  chan struct{}
 	ioDone    chan error
 	closeOnce sync.Once
@@ -95,10 +97,23 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 	session := &Session{
 		transport: transport, options: options,
 		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
-		received: make(chan atRead, 8), readDone: make(chan struct{}),
+		received: make(chan atRead, 8), readWake: make(chan struct{}, 1), readDone: make(chan struct{}),
 	}
 	go session.readLoop()
+	go session.idleLoop()
 	return session, nil
+}
+
+// SetURCHandler registers a callback for every unsolicited result as soon as
+// it is parsed, whether it arrived during a command or while the port was
+// idle. The callback runs with the session lock held: it must not block or
+// issue AT commands. A nil handler removes the callback.
+func (session *Session) SetURCHandler(handler func(string)) {
+	if handler == nil {
+		session.onURC.Store(nil)
+		return
+	}
+	session.onURC.Store(&handler)
 }
 
 // Poisoned reports whether this session must be discarded after a transport
@@ -271,9 +286,72 @@ func (session *Session) readLoop() {
 		case <-session.lifetime.Done():
 			return
 		}
+		select {
+		case session.readWake <- struct{}{}:
+		default:
+		}
 		if err != nil {
 			return
 		}
+	}
+}
+
+// idleLoop parses input that arrives while no command owns the port, so URCs
+// such as +CMTI reach the handler immediately instead of waiting for the next
+// command's pre-write drain.
+func (session *Session) idleLoop() {
+	for {
+		select {
+		case <-session.readWake:
+		case <-session.lifetime.Done():
+			return
+		}
+		if err := session.lock(session.lifetime); err != nil {
+			return
+		}
+		session.consumeIdleLocked()
+		session.unlock()
+	}
+}
+
+// consumeIdleLocked parses complete lines while no caller owns the port. A
+// pending transaction seen here was abandoned by a timed-out or cancelled
+// caller (a live caller holds the lock until its final), so its late reply is
+// consumed exactly as readNextLocked does for a departed caller: echo and
+// response lines are discarded, URCs are dispatched, and the final clears it.
+// Prompt handling, an unfinished write, partial lines and read errors are left
+// for the next command, which already knows how to recover them.
+func (session *Session) consumeIdleLocked() {
+	if session.Poisoned() {
+		return
+	}
+	if session.ioDone != nil {
+		select {
+		case err := <-session.ioDone:
+			session.ioDone = nil
+			if err != nil {
+				return
+			}
+		default:
+			return
+		}
+	}
+	session.receivePendingLocked()
+	for {
+		if session.pending != nil && session.pending.awaitPrompt {
+			return
+		}
+		if session.skipSpace && len(session.readBuf) > 0 {
+			session.skipSpace = false
+			if session.readBuf[0] == ' ' {
+				session.readBuf = session.readBuf[1:]
+			}
+		}
+		line, ok := popLine(&session.readBuf)
+		if !ok {
+			return
+		}
+		session.consumeLineLocked(line, nil)
 	}
 }
 
@@ -304,6 +382,12 @@ func (session *Session) runIOLocked(ctx context.Context, operation func() error)
 			session.poisoned.Store(true)
 		}
 		done <- err
+		// The idle parser skips input while I/O is unfinished; wake it again so
+		// a reply that arrived meanwhile is not left until the next command.
+		select {
+		case session.readWake <- struct{}{}:
+		default:
+		}
 	}()
 	return session.waitIOLocked(ctx)
 }
@@ -491,6 +575,9 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 }
 
 func (session *Session) enqueueURCLocked(line string) {
+	if handler := session.onURC.Load(); handler != nil {
+		(*handler)(line)
+	}
 	if len(session.urcs) >= session.options.MaxURCs {
 		copy(session.urcs, session.urcs[1:])
 		session.urcs[len(session.urcs)-1] = line
@@ -605,6 +692,7 @@ func isURC(line string) bool {
 		"+CMTI:",
 		"+CMT:",
 		"+CDS:",
+		"+CDSI:",
 		"+CREG:",
 		"+CGREG:",
 		"+CEREG:",

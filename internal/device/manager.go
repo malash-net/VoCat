@@ -50,6 +50,8 @@ type Manager struct {
 	networkEventSubscribers map[chan string]struct{}
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
+	smsEventsMu             sync.Mutex
+	smsEventSubscribers     map[*SMSEvents]struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -138,7 +140,10 @@ type managedDevice struct {
 	discovered         bool
 	preFlightMode      *int
 	resetClientOnLock  bool
-	simPIN             string
+	// smsIndicationRetryAt backs off AT+CNMI configuration after a failure.
+	// Guarded by opMu.
+	smsIndicationRetryAt time.Time
+	simPIN               string
 }
 
 func NewManager(options Options) (*Manager, error) {
@@ -558,6 +563,7 @@ func (manager *Manager) clientLocked(
 	if err != nil {
 		return nil, err
 	}
+	manager.watchSMSURCs(client, candidate.ID)
 	state.client = client
 	return client, nil
 }

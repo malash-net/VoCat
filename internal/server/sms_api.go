@@ -639,6 +639,12 @@ func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText
 }
 
 func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
+	s.syncModemSMSFor(ctx, onlyDevice, "")
+}
+
+// syncModemSMSFor scans modem storage for every configured device, or only
+// the device configured as onlyDevice and/or attached as onlyPhysical.
+func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical string) {
 	s.smsSyncMu.Lock()
 	defer s.smsSyncMu.Unlock()
 	if s.devices == nil {
@@ -678,21 +684,13 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			}
 		}
 		entry, physicalID, present := s.physicalForConfig(config)
-		if !present {
+		if !present || (onlyPhysical != "" && physicalID != onlyPhysical) {
 			continue
 		}
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
-		// OpenStick 410 controls cellular registration through QMI but receives
-		// stored SMS through its AT port. Its firmware can reset CNMI after a
-		// profile switch, leaving newly delivered SMS invisible to VoCat.
-		if store.NormalizeDeviceType(config.DeviceType) == store.DeviceTypeWiFi410 {
-			setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
-			_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
-			cancelSetup()
-			if setupErr != nil {
-				s.logger.Debug("OpenStick 410 cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
-			}
-		}
+		// ListSMS re-asserts AT+CNMI on every scan: firmware such as the
+		// OpenStick 410 resets it after a profile switch, which would otherwise
+		// leave newly delivered SMS invisible or unannounced.
 		listContext, cancelList := context.WithTimeout(ctx, 30*time.Second)
 		listing, err := s.devices.ListSMS(listContext, physicalID)
 		cancelList()
@@ -721,7 +719,6 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			snapshotString(currentEntry.Snapshot, func(snapshot *device.Snapshot) string { return snapshot.IMEI }),
 			config.ModemIMEI,
 		)
-		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
 		for _, message := range messages {
@@ -765,8 +762,22 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			if message.Direction == device.SMSDirectionSubmitted {
 				direction = "outbound"
 			}
-			messageID := modemSMSMessageID(message, modemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)])
+			messageID := modemSMSMessageID(message)
+			partKey := ""
+			if isModemConcatSegment(message) {
+				// Multipart groups are resolved from persisted rows, never from
+				// which slots the other segments occupy in this scan: segments
+				// are deleted as soon as they are saved and slots get reused.
+				partKey = modemSMSPartKey(message)
+				resolved, resolveErr := s.resolveModemConcatMessageID(ctx, message, modemIMEI, config.ID, peer, partKey, timestamp)
+				if resolveErr != nil {
+					s.logger.Warn("resolve modem multipart SMS group failed", "category", "sms", "device_id", config.ID, "raw_error", resolveErr)
+					continue
+				}
+				messageID = resolved
+			}
 			extra, _ := json.Marshal(map[string]any{
+				"concat_part_key":    partKey,
 				"modem_index":        message.Index,
 				"storage":            message.Storage,
 				"storage_status":     message.StorageStatus,
@@ -798,8 +809,11 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				Source:        "cellular_at",
 				PartsTotal:    concatTotal(message.Concat),
 				DeliveryState: message.DeliveryStatus,
-				Read:          message.StorageStatus == device.SMSStatusReceivedRead,
-				Extra:         extra,
+				// AT+CMGL=4 itself flips REC UNREAD to REC READ, so the modem
+				// status says nothing about the user. Read state is owned by the
+				// app; the store keeps an existing row's read flag.
+				Read:  false,
+				Extra: extra,
 			})
 			if saveErr != nil {
 				s.logger.Warn("persist modem SMS failed", "category", "sms", "device_id", config.ID, "raw_error", saveErr)
@@ -874,27 +888,63 @@ func (s *Server) clearPersistedModemSMS(ctx context.Context, physicalID, configI
 	}
 }
 
-func modemSMSMessageID(message device.SMSMessage, modemIMEI, deviceID, peer, concatSource string) string {
+// modemSMSMessageID is the per-slot identity of a single-part modem SMS.
+// Multipart segments are addressed by resolveModemConcatMessageID instead.
+func modemSMSMessageID(message device.SMSMessage) string {
 	digest := sha256.Sum256([]byte(message.RawPDU))
-	messageID := fmt.Sprintf(
+	return fmt.Sprintf(
 		"modem:%s:%d:%s",
 		message.Storage,
 		message.Index,
 		hex.EncodeToString(digest[:8]),
 	)
-	if message.Concat != nil && message.Concat.Total > 1 {
-		// A segment of a carrier-split long SMS. Address the whole message
-		// with a storage-generation id so SaveSMSMessage folds every segment
-		// into one row without colliding with an older message that reused the
-		// same UDH reference. SM and ME can expose duplicate copies of the same
-		// slots, so the generation uses the first segment index, not storage.
-		source := firstNonEmpty(concatSource, "cellular_at")
-		messageID = store.StableConcatMessageID(
-			source, modemIMEI, deviceID, peer,
-			message.Concat.Reference, message.Concat.Total,
-		)
+}
+
+func isModemConcatSegment(message device.SMSMessage) bool {
+	return message.Concat != nil && message.Concat.Total > 1
+}
+
+// modemSMSPartKey fingerprints one delivery of a segment independent of its
+// storage slot and storage area. It uses decoded fields rather than the raw
+// PDU so the SM and ME copies of one segment share a key; the SMSC timestamp
+// still separates a later message that reuses the UDH reference and text.
+func modemSMSPartKey(message device.SMSMessage) string {
+	timestamp := ""
+	if message.ServiceCenterTimestamp != nil {
+		timestamp = message.ServiceCenterTimestamp.UTC().Format(time.RFC3339Nano)
 	}
-	return messageID
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		firstNonEmpty(message.From, message.To), timestamp,
+		strconv.Itoa(message.Concat.Reference), strconv.Itoa(message.Concat.Total),
+		strconv.Itoa(message.Concat.Sequence), message.Text,
+	}, "\x00")))
+	return hex.EncodeToString(digest[:8])
+}
+
+func modemConcatSegment(message device.SMSMessage, modemIMEI, deviceID, peer, partKey string, timestamp time.Time) store.ConcatSegment {
+	return store.ConcatSegment{
+		ModemIMEI: modemIMEI, DeviceID: deviceID, Peer: peer,
+		Reference: message.Concat.Reference, Total: message.Concat.Total, Sequence: message.Concat.Sequence,
+		PartKey: partKey, Text: message.Text, Timestamp: timestamp,
+	}
+}
+
+// resolveModemConcatMessageID returns the stored group for a multipart
+// segment, or a new group ID founded by this segment's part key.
+func (s *Server) resolveModemConcatMessageID(
+	ctx context.Context,
+	message device.SMSMessage,
+	modemIMEI, deviceID, peer, partKey string,
+	timestamp time.Time,
+) (string, error) {
+	segment := modemConcatSegment(message, modemIMEI, deviceID, peer, partKey, timestamp)
+	if messageID, found, err := s.store.ResolveConcatSMSGroup(ctx, "cellular_at", segment); err != nil || found {
+		return messageID, err
+	}
+	return store.StableConcatMessageID(
+		"cellular_at:"+partKey, modemIMEI, deviceID, peer,
+		message.Concat.Reference, message.Concat.Total,
+	), nil
 }
 
 type smsSubscriptionIdentity struct {
@@ -937,56 +987,6 @@ func (s *Server) smsLocalPhone(
 		return strings.TrimSpace(snapshot.Phone.Number)
 	}
 	return ""
-}
-
-// modemSMSConcatSources identifies every multipart group by the storage slot of
-// its first segment. Carrier and modem storage can interleave unrelated SMS
-// between segments, so deriving that slot through index arithmetic separates a
-// single long SMS into several rows. The real first-segment slot also keeps
-// messages that reuse the same UDH reference in distinct groups.
-func modemSMSConcatSources(messages []device.SMSMessage) map[string]string {
-	firstSlots := make(map[string][]int)
-	for _, message := range messages {
-		if message.Concat == nil || message.Concat.Total <= 1 || message.Concat.Sequence != 1 {
-			continue
-		}
-		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" {
-			continue
-		}
-		key := modemSMSConcatKey(message, peer)
-		firstSlots[key] = append(firstSlots[key], message.Index)
-	}
-	for key := range firstSlots {
-		sort.Ints(firstSlots[key])
-	}
-
-	result := make(map[string]string)
-	for _, message := range messages {
-		if message.Concat == nil || message.Concat.Total <= 1 {
-			continue
-		}
-		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" {
-			continue
-		}
-		source := ""
-		for _, firstSlot := range firstSlots[modemSMSConcatKey(message, peer)] {
-			if firstSlot > message.Index {
-				break
-			}
-			source = fmt.Sprintf("cellular_at:%d", firstSlot)
-		}
-		if source == "" {
-			source = fmt.Sprintf("cellular_at:pending:%d", message.Index)
-		}
-		result[modemSMSStorageKey(message)] = source
-	}
-	return result
-}
-
-func modemSMSConcatKey(message device.SMSMessage, peer string) string {
-	return peer + ":" + strconv.Itoa(message.Concat.Reference) + ":" + strconv.Itoa(message.Concat.Total)
 }
 
 func modemSMSStorageKey(message device.SMSMessage) string {
@@ -1052,12 +1052,18 @@ func (s *Server) deleteModemSMS(ctx context.Context, stored store.SMSMessage) er
 		return fmt.Errorf("list modem SMS before deletion: %w", err)
 	}
 	s.rememberSMSStorage(config.ID, listing.Storage)
-	modemMessages := listing.Messages
-	concatSources := modemSMSConcatSources(modemMessages)
 	locations := make(map[string]device.SMSMessage)
-	for _, message := range modemMessages {
+	for _, message := range listing.Messages {
 		peer := firstNonEmpty(message.From, message.To)
-		if peer == "" || modemSMSMessageID(message, stored.ModemIMEI, config.ID, peer, concatSources[modemSMSStorageKey(message)]) != stored.MessageID {
+		if peer == "" {
+			continue
+		}
+		if isModemConcatSegment(message) {
+			segment := modemConcatSegment(message, stored.ModemIMEI, config.ID, peer, modemSMSPartKey(message), time.Time{})
+			if !store.ConcatSMSHoldsSegment(stored, segment) {
+				continue
+			}
+		} else if modemSMSMessageID(message) != stored.MessageID {
 			continue
 		}
 		locations[modemSMSStorageKey(message)] = message
@@ -1099,13 +1105,34 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	}
 }
 
-// StartSMSSyncLoop periodically persists inbound cellular SMS even when no
-// client has the SMS page open. The first tick is delayed so startup SIM/AKA
-// work gets exclusive use of the modem. Stable VoWiFi sessions still scan SM
-// and ME as a catch-up path for messages delivered while the card was offline.
+// smsArrivalSettleDelay gives the modem time to finish writing a message that
+// it announced with +CMTI and lets the remaining segments of a concatenated
+// SMS arrive, so one scan usually stores the complete message.
+const smsArrivalSettleDelay = 500 * time.Millisecond
+
+type cellularSMSEventController interface {
+	SubscribeSMSEvents(context.Context) (*device.SMSEvents, error)
+}
+
+// StartSMSSyncLoop persists inbound cellular SMS even when no client has the
+// SMS page open. A +CMTI indication triggers an immediate scan of that modem;
+// the periodic tick remains the safety net for modems that do not announce
+// new messages. The first tick is delayed so startup SIM/AKA work gets
+// exclusive use of the modem. Stable VoWiFi sessions still scan SM and ME as a
+// catch-up path for messages delivered while the card was offline.
 func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
+	}
+	var arrivals *device.SMSEvents
+	var wake <-chan struct{}
+	if source, ok := s.devices.(cellularSMSEventController); ok {
+		subscribed, err := source.SubscribeSMSEvents(ctx)
+		if err != nil {
+			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
+		} else {
+			arrivals, wake = subscribed, subscribed.Wake()
+		}
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1115,6 +1142,20 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
+		case _, ok := <-wake:
+			if !ok {
+				wake = nil
+				continue
+			}
+			if !waitTelegram(ctx, smsArrivalSettleDelay) {
+				return
+			}
+			// Take after the settle delay so every arrival during it, from any
+			// modem, is folded into this pass. Arrivals during the scans below
+			// stay pending and re-signal wake for the next pass.
+			for _, physicalID := range arrivals.Take() {
+				s.syncModemSMSFor(ctx, "", physicalID)
+			}
 		}
 	}
 }
