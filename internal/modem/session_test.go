@@ -408,6 +408,45 @@ func TestSessionIdleRecoversAbandonedTransactionAndDispatchesURC(t *testing.T) {
 	})
 }
 
+func TestSessionIdleParsesReplyThatArrivedBeforeCanceledWriteFinished(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		const command = "AT+CFUN?\r"
+		transport := &transcriptTransport{steps: []transportStep{{
+			write:  command,
+			result: func() (int, error) { close(started); <-release; return len(command), nil },
+		}}}
+		session := newTestSession(t, transport)
+		var mu sync.Mutex
+		calls := 0
+		session.SetURCHandler(func(string) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { _, err := session.Execute(ctx, "AT+CFUN?"); done <- err }()
+		<-started
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled command = %v", err)
+		}
+
+		// The reply and a new SMS arrive while the write is still unfinished.
+		transport.enqueue("\r\nOK\r\n+CMTI: \"SM\",2\r\n")
+		synctest.Wait()
+		close(release)
+		synctest.Wait()
+		mu.Lock()
+		got := calls
+		mu.Unlock()
+		if got != 1 {
+			t.Fatalf("URC callbacks after the write finished = %d, want 1", got)
+		}
+	})
+}
+
 func TestSessionCancelsAndClosesBlockedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started, release := make(chan struct{}), make(chan struct{})

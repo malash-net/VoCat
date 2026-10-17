@@ -382,6 +382,12 @@ func (session *Session) runIOLocked(ctx context.Context, operation func() error)
 			session.poisoned.Store(true)
 		}
 		done <- err
+		// The idle parser skips input while I/O is unfinished; wake it again so
+		// a reply that arrived meanwhile is not left until the next command.
+		select {
+		case session.readWake <- struct{}{}:
+		default:
+		}
 	}()
 	return session.waitIOLocked(ctx)
 }

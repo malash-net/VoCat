@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -869,67 +870,199 @@ func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
 	<-done
 }
 
-func TestSyncModemSMSKeepsIncompleteMultipartSegmentsUntilMerged(t *testing.T) {
+type multipartSyncFixture struct {
+	t          *testing.T
+	ctx        context.Context
+	database   *store.Store
+	controller *smsDeletionController
+	server     *Server
+}
+
+const (
+	multipartDeviceID = "ec20-1"
+	multipartIMEI     = "867394042309830"
+	multipartPeer     = "+447700900123"
+)
+
+func newMultipartSyncFixture(t *testing.T) *multipartSyncFixture {
+	t.Helper()
 	ctx := context.Background()
 	database, err := store.Open(ctx, ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	const (
-		deviceID = "ec20-1"
-		imei     = "867394042309830"
-	)
 	if err := database.UpsertDevice(ctx, store.Device{
-		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
-		ModemIMEI: imei, SMSEnabled: true,
+		ID: multipartDeviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: multipartIMEI, SMSEnabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	receivedAt := time.Unix(1_700_000_000, 0).UTC()
-	segment := func(index, sequence int, body string) device.SMSMessage {
-		return device.SMSMessage{
-			Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
-			Direction: device.SMSDirectionReceived, From: "+447700900123", Text: body,
-			Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &receivedAt,
-			Concat: &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: sequence},
-			RawPDU: "SM-" + body,
+	controller := &smsDeletionController{fakeDeviceController: fakeDeviceController{entry: device.Device{
+		ID: multipartDeviceID, Discovered: true,
+		Snapshot: &device.Snapshot{DeviceID: multipartDeviceID, IMEI: multipartIMEI, IMSI: "23433"},
+	}}}
+	return &multipartSyncFixture{
+		t: t, ctx: ctx, database: database, controller: controller,
+		server: &Server{store: database, logger: regionTestLogger(), devices: controller},
+	}
+}
+
+func multipartSegment(index, reference, total, sequence int, body string, at time.Time) device.SMSMessage {
+	return device.SMSMessage{
+		Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: multipartPeer, Text: body,
+		Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &at,
+		Concat: &device.SMSConcatInfo{Reference: reference, Total: total, Sequence: sequence},
+		RawPDU: fmt.Sprintf("SM-%d-%d-%s", reference, sequence, body),
+	}
+}
+
+// deliver puts messages into modem storage, runs one scan and returns the
+// slots the scan deleted.
+func (fixture *multipartSyncFixture) deliver(messages ...device.SMSMessage) []string {
+	fixture.t.Helper()
+	fixture.controller.mu.Lock()
+	fixture.controller.storedMessages = append(fixture.controller.storedMessages, messages...)
+	before := len(fixture.controller.deleted)
+	fixture.controller.mu.Unlock()
+	fixture.server.syncModemSMS(fixture.ctx, multipartDeviceID)
+	fixture.controller.mu.Lock()
+	defer fixture.controller.mu.Unlock()
+	deleted := append([]string(nil), fixture.controller.deleted[before:]...)
+	sort.Strings(deleted)
+	return deleted
+}
+
+func (fixture *multipartSyncFixture) stored() []store.SMSMessage {
+	fixture.t.Helper()
+	stored, err := fixture.database.ListSMSMessages(fixture.ctx, store.SMSFilter{DeviceID: multipartDeviceID})
+	if err != nil {
+		fixture.t.Fatal(err)
+	}
+	return stored
+}
+
+func TestSyncModemSMSMergesSegmentThatReusesFreedSlot(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	at := time.Unix(1_700_000_000, 0).UTC()
+	plain := device.SMSMessage{
+		Index: 1, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: "+447700900999", Text: "plain",
+		Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &at, RawPDU: "plain",
+	}
+	// The first segment is saved and released right away; the second segment
+	// then lands in the lower slot the plain SMS freed.
+	if deleted := fixture.deliver(plain, multipartSegment(2, 41, 2, 1, "first ", at)); strings.Join(deleted, ",") != "SM:1,SM:2" {
+		t.Fatalf("first scan deleted %v", deleted)
+	}
+	if deleted := fixture.deliver(multipartSegment(1, 41, 2, 2, "second", at.Add(2*time.Second))); strings.Join(deleted, ",") != "SM:1" {
+		t.Fatalf("second scan deleted %v", deleted)
+	}
+	var multipart []store.SMSMessage
+	for _, message := range fixture.stored() {
+		if message.Peer == multipartPeer {
+			multipart = append(multipart, message)
 		}
 	}
-	controller := &smsDeletionController{
-		fakeDeviceController: fakeDeviceController{entry: device.Device{
-			ID: deviceID, Discovered: true,
-			Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
-		}},
-		storedMessages: []device.SMSMessage{segment(3, 1, "part one ")},
+	if len(multipart) != 1 || multipart[0].Body != "first second" ||
+		!store.ConcatSMSReadyToNotify(multipart[0].MessageID, multipart[0].Extra) {
+		t.Fatalf("multipart rows = %#v", multipart)
 	}
-	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
+}
 
-	// An arrival-triggered scan can run before the second segment is stored.
-	server.syncModemSMS(ctx, deviceID)
-	controller.mu.Lock()
-	deleted := append([]string(nil), controller.deleted...)
-	controller.storedMessages = append(controller.storedMessages, segment(4, 2, "part two"))
-	controller.mu.Unlock()
-	if len(deleted) != 0 {
-		t.Fatalf("incomplete multipart segment was cleared: %v", deleted)
+func TestSyncModemSMSMergesSegmentsArrivingInReverseOrder(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	at := time.Unix(1_700_000_000, 0).UTC()
+	fixture.deliver(multipartSegment(1, 9, 2, 2, "tail", at.Add(time.Second)))
+	fixture.deliver(multipartSegment(1, 9, 2, 1, "head ", at))
+	stored := fixture.stored()
+	if len(stored) != 1 || stored[0].Body != "head tail" ||
+		!store.ConcatSMSReadyToNotify(stored[0].MessageID, stored[0].Extra) {
+		t.Fatalf("stored = %#v", stored)
 	}
+}
 
-	server.syncModemSMS(ctx, deviceID)
-	controller.mu.Lock()
-	remaining := len(controller.storedMessages)
-	deleted = append([]string(nil), controller.deleted...)
-	controller.mu.Unlock()
-	sort.Strings(deleted)
-	if remaining != 0 || strings.Join(deleted, ",") != "SM:3,SM:4" {
-		t.Fatalf("remaining = %d, deleted = %v", remaining, deleted)
+func TestSyncModemSMSReleasesSegmentsOfIncompleteMessages(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	old := time.Now().Add(-48 * time.Hour).UTC()
+	var segments []device.SMSMessage
+	for index := 1; index <= 40; index++ {
+		segments = append(segments, multipartSegment(index, index, 2, 1, fmt.Sprintf("orphan %d ", index), old))
 	}
-	stored, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if deleted := fixture.deliver(segments...); len(deleted) != 40 {
+		t.Fatalf("deleted %d of 40 persisted segments", len(deleted))
+	}
+	if stored := fixture.stored(); len(stored) != 40 {
+		t.Fatalf("persisted %d of 40 partial messages", len(stored))
+	}
+}
+
+func TestSyncModemSMSDoesNotTakeReadStateFromModemRescan(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	if err := developer.SetAutoClearModemStorage(fixture.ctx, fixture.database, false); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(1_700_000_000, 0).UTC()
+	fixture.deliver(multipartSegment(1, 5, 2, 1, "first ", at))
+	// AT+CMGL=4 marked the first segment read on the modem.
+	fixture.controller.mu.Lock()
+	fixture.controller.storedMessages[0].StorageStatus = device.SMSStatusReceivedRead
+	fixture.controller.mu.Unlock()
+	fixture.deliver(multipartSegment(2, 5, 2, 2, "second", at))
+	stored := fixture.stored()
+	if len(stored) != 1 || stored[0].Body != "first second" || stored[0].Read {
+		t.Fatalf("stored = %#v", stored)
+	}
+}
+
+func TestSyncModemSMSSeparatesReusedReferenceWithSameText(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	at := time.Unix(1_700_000_000, 0).UTC()
+	fixture.deliver(multipartSegment(1, 3, 2, 1, "same ", at), multipartSegment(2, 3, 2, 2, "text", at))
+	later := at.Add(time.Hour)
+	fixture.deliver(multipartSegment(1, 3, 2, 1, "same ", later), multipartSegment(2, 3, 2, 2, "text", later))
+	stored := fixture.stored()
+	if len(stored) != 2 {
+		t.Fatalf("stored = %#v", stored)
+	}
+	for _, message := range stored {
+		if message.Body != "same text" || !store.ConcatSMSReadyToNotify(message.MessageID, message.Extra) {
+			t.Fatalf("stored = %#v", stored)
+		}
+	}
+}
+
+func TestSyncModemSMSRescanMatchesLegacyMultipartRow(t *testing.T) {
+	fixture := newMultipartSyncFixture(t)
+	if err := developer.SetAutoClearModemStorage(fixture.ctx, fixture.database, false); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(1_700_000_000, 0).UTC()
+	segments := []device.SMSMessage{multipartSegment(20, 7, 2, 1, "legacy ", at), multipartSegment(21, 7, 2, 2, "row", at)}
+	// A row written before part keys existed, under the old slot-based ID.
+	legacyID := store.StableConcatMessageID("cellular_at:20", multipartIMEI, multipartDeviceID, multipartPeer, 7, 2)
+	for _, segment := range segments {
+		extra, _ := json.Marshal(map[string]any{"concat": segment.Concat, "keep_durable_id_on_rescan": true})
+		if _, err := fixture.database.SaveSMSMessage(fixture.ctx, store.SMSMessage{
+			MessageID: legacyID, DeviceID: multipartDeviceID, ModemIMEI: multipartIMEI,
+			Peer: multipartPeer, Direction: "inbound", Body: segment.Text, Timestamp: at,
+			Source: "cellular_at", PartsTotal: 2, Extra: extra,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest, err := fixture.database.LatestSMSMessageID(fixture.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) != 1 || stored[0].Body != "part one part two" ||
-		!store.ConcatSMSReadyToNotify(stored[0].MessageID, stored[0].Extra) {
-		t.Fatalf("stored messages = %#v", stored)
+	fixture.deliver(segments...)
+	fixture.deliver()
+	stored := fixture.stored()
+	if len(stored) != 1 || stored[0].MessageID != legacyID || stored[0].Body != "legacy row" {
+		t.Fatalf("stored = %#v", stored)
+	}
+	if fresh, err := fixture.database.ListInboundSMSAfterID(fixture.ctx, latest, 10); err != nil || len(fresh) != 0 {
+		t.Fatalf("rescan surfaced rows to notifiers: %#v, %v", fresh, err)
 	}
 }
