@@ -51,6 +51,14 @@ type Session struct {
 	urcs      []string
 	pending   *atTransaction
 	poisoned  atomic.Bool
+	busy      atomic.Bool
+	idleMu    sync.Mutex
+	idle      chan struct{}
+	idleBuf   []byte
+	idleData  chan struct{}
+
+	smsArrivalHandler atomic.Pointer[func()]
+	smsScanTail       []byte
 
 	recoveryDeadline time.Time
 	ioDeadline       time.Time
@@ -96,6 +104,7 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 		transport: transport, options: options,
 		gate: make(chan struct{}, 1), lifetime: lifetime, cancel: cancel,
 		received: make(chan atRead, 8), readDone: make(chan struct{}),
+		idle: make(chan struct{}), idleData: make(chan struct{}, 1),
 	}
 	go session.readLoop()
 	return session, nil
@@ -192,8 +201,12 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	}
 	// Never assign an old reply (including idle input and partial trailing
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
+	session.setBusy(true)
+	defer session.setBusy(false)
 	for {
 		session.receivePendingLocked()
+		// Idle bytes were read after anything already queued, so they append.
+		session.drainIdleLocked()
 		if session.pending == nil {
 			session.readBuf = bytes.TrimLeft(session.readBuf, "\r\n\x00 \t")
 			if len(session.readBuf) == 0 && session.readErr == nil {
@@ -214,6 +227,7 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 		command: command, responsePrefix: expectedResponsePrefix(command), awaitPrompt: interactive,
 	}
 	session.pending = transaction
+	session.setBusy(true)
 	// Cancellation does not stop the modem. Preserve the caller's deadline and
 	// allow known long commands to finish even when it was shorter than usual.
 	deadline, _ := ctx.Deadline()
@@ -263,18 +277,83 @@ func (session *Session) readLoop() {
 			continue
 		}
 		batch := atRead{data: append([]byte(nil), buffer[:max(count, 0)]...), err: err}
+		session.sniffSMSArrival(batch.data)
 		if err != nil {
 			session.poisoned.Store(true)
 		}
-		select {
-		case session.received <- batch:
-		case <-session.lifetime.Done():
-			return
+		if busy, idle := session.busySignal(); busy {
+			select {
+			case session.received <- batch:
+			case <-idle:
+				session.bufferIdle(batch.data)
+			case <-session.lifetime.Done():
+				return
+			}
+		} else {
+			session.bufferIdle(batch.data)
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// SetSMSArrivalHandler registers a callback invoked when the raw byte stream
+// carries a new-SMS indication. The handler runs on the read goroutine and must
+// not block.
+func (session *Session) SetSMSArrivalHandler(handler func()) {
+	if handler == nil {
+		session.smsArrivalHandler.Store(nil)
+		return
+	}
+	session.smsArrivalHandler.Store(&handler)
+}
+
+// sniffSMSArrival scans one raw read for a new-SMS indication. It touches
+// neither the gate, the pending transaction, nor the read buffer.
+func (session *Session) sniffSMSArrival(data []byte) {
+	handler := session.smsArrivalHandler.Load()
+	if handler == nil {
+		return
+	}
+	scanned := data
+	if len(session.smsScanTail) > 0 {
+		scanned = append(append([]byte(nil), session.smsScanTail...), data...)
+	}
+	if bytes.Contains(bytes.ToLower(scanned), smsIndicationNeedle) {
+		(*handler)()
+	}
+	// Keep the tail of what was scanned, not of this read alone.
+	tail := min(len(scanned), len(smsIndicationNeedle)-1)
+	session.smsScanTail = append(session.smsScanTail[:0], scanned[len(scanned)-tail:]...)
+}
+
+// maxIdleBuffer bounds bytes accumulated while nothing consumes the session.
+// Idle traffic is unsolicited, so an unbounded buffer would grow forever.
+const maxIdleBuffer = 64 << 10
+
+// setBusy records whether a reader is draining received. Dropping to idle wakes
+// a readLoop already parked in the blocking send, which would otherwise never
+// re-check the flag.
+func (session *Session) setBusy(busy bool) {
+	session.idleMu.Lock()
+	defer session.idleMu.Unlock()
+	session.busy.Store(busy)
+	if busy {
+		return
+	}
+	close(session.idle)
+	session.idle = make(chan struct{})
+}
+
+// busySignal atomically reports whether a reader is draining and, if so, the
+// channel that closes when it stops. Sampling the two separately would let a
+// caller go idle in between, leaving readLoop parked on a channel that will
+// never close.
+func (session *Session) busySignal() (bool, <-chan struct{}) {
+	session.idleMu.Lock()
+	defer session.idleMu.Unlock()
+	return session.busy.Load(), session.idle
 }
 
 func (session *Session) receivePendingLocked() {
@@ -287,6 +366,30 @@ func (session *Session) receivePendingLocked() {
 			return
 		}
 	}
+}
+
+func (session *Session) bufferIdle(data []byte) {
+	session.idleMu.Lock()
+	session.idleBuf = append(session.idleBuf, data...)
+	if len(session.idleBuf) > maxIdleBuffer {
+		session.idleBuf = session.idleBuf[len(session.idleBuf)-maxIdleBuffer:]
+	}
+	// Wake a reader parked in readNextLocked so it picks these bytes up.
+	select {
+	case session.idleData <- struct{}{}:
+	default:
+	}
+	session.idleMu.Unlock()
+}
+
+// drainIdleLocked appends bytes read while idle. They arrived after whatever
+// is already buffered, so they must not be prepended.
+func (session *Session) drainIdleLocked() {
+	session.idleMu.Lock()
+	idle := session.idleBuf
+	session.idleBuf = nil
+	session.idleMu.Unlock()
+	session.readBuf = append(session.readBuf, idle...)
 }
 
 // Only one I/O task may run; even after cancellation, later operations wait
@@ -349,6 +452,10 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// readLoop only feeds received while busy, so anything buffered while
+		// idle must be picked up here or this loop waits on a line that already
+		// arrived.
+		session.drainIdleLocked()
 		if session.skipSpace && len(session.readBuf) > 0 {
 			session.skipSpace = false
 			if session.readBuf[0] == ' ' {
@@ -384,6 +491,8 @@ func (session *Session) readNextLocked(ctx context.Context, response *Response, 
 		case batch := <-session.received:
 			session.readBuf = append(session.readBuf, batch.data...)
 			session.readErr = batch.err
+		case <-session.idleData:
+			continue
 		case <-ctx.Done():
 			continue
 		case <-recovery:
@@ -452,6 +561,7 @@ func (session *Session) consumeLineLocked(line string, response *Response) {
 	pending.remainingEcho = nil
 	if isFinalResult(line) || callResult {
 		session.pending = nil
+		session.setBusy(false)
 		session.recoveryDeadline = time.Time{}
 		if response != nil {
 			response.Final = line
@@ -477,6 +587,9 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 	if session.Poisoned() {
 		return "", ErrSessionClosed
 	}
+	session.setBusy(true)
+	defer session.setBusy(false)
+	session.drainIdleLocked()
 	for {
 		for index, line := range session.urcs {
 			if predicate(line) {
@@ -591,6 +704,10 @@ func isFinalResult(line string) bool {
 		strings.HasPrefix(upper, "+CME ERROR:") ||
 		strings.HasPrefix(upper, "+CMS ERROR:")
 }
+
+// smsIndicationNeedle is the new-SMS indication a modem emits after
+// AT+CNMI=2,1, lower-cased to match a lower-cased read.
+var smsIndicationNeedle = []byte("+cmti:")
 
 func isURC(line string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(line))

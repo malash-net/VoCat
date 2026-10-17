@@ -337,6 +337,209 @@ func TestSessionIdleInputStaysUnsolicited(t *testing.T) {
 	})
 }
 
+func TestSessionSMSArrivalHandlerFiresOnIdleIndication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// No command is ever issued, so the URC parser never runs.
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 1)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		transportForSession(t, session).enqueue("\r\n+CMTI: \"SM\",7\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+		default:
+			t.Fatal("idle +CMTI did not invoke the arrival handler")
+		}
+	})
+}
+
+func TestSessionSMSArrivalHandlerMatchesSplitIndication(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		chunks []string
+	}{
+		{"two reads", []string{"\r\n+CM", "TI: \"SM\",7\r\n"}},
+		// Short reads are legal on a serial port; the prefix may span more than
+		// two of them.
+		{"three reads", []string{"+C", "MT", "I: \"SM\",7\r\n"}},
+		{"byte at a time", []string{"+", "C", "M", "T", "I", ":", " \"SM\",7\r\n"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				session := newTestSession(t, &transcriptTransport{})
+				fired := make(chan struct{}, 1)
+				session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+				transportForSession(t, session).enqueue(test.chunks...)
+				synctest.Wait()
+				select {
+				case <-fired:
+				default:
+					t.Fatal("split +CMTI was not detected")
+				}
+			})
+		})
+	}
+}
+
+// Sniffing must not disturb a command's response, and the indication must
+// still reach WaitURC as a normal URC.
+func TestSessionSMSArrivalHandlerKeepsTransactionIntact(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{steps: []transportStep{
+			{write: "AT+CSQ\r", chunks: []string{"\r\n+CMTI: \"SM\",7\r\n+CS", "Q: 24,99\r\nOK\r"}},
+		}}
+		session := newTestSession(t, transport)
+		fired := make(chan struct{}, 1)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		response, err := session.Execute(context.Background(), "AT+CSQ")
+		if err != nil || response.Text() != "+CSQ: 24,99" {
+			t.Fatalf("response = %#v, %v", response, err)
+		}
+		select {
+		case <-fired:
+		default:
+			t.Fatal("interleaved +CMTI was not detected")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		line, err := session.WaitURC(ctx, func(line string) bool { return line == `+CMTI: "SM",7` })
+		if err != nil || line != `+CMTI: "SM",7` {
+			t.Fatalf("URC = %q, %v", line, err)
+		}
+	})
+}
+
+// readLoop must keep draining the port when nothing consumes the queue: both
+// while plain idle and after a timed-out command left the caller behind.
+func TestSessionKeepsReadingWithoutConsumer(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		steps  []transportStep
+		settle func(*testing.T, *Session)
+	}{
+		{name: "idle", settle: func(*testing.T, *Session) {}},
+		{
+			name:  "after timed-out command",
+			steps: []transportStep{{write: "AT+CSQ\r", chunks: []string{}}},
+			settle: func(t *testing.T, session *Session) {
+				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				if _, err := session.Execute(ctx, "AT+CSQ"); err == nil {
+					t.Fatal("command unexpectedly succeeded")
+				}
+				if session.busy.Load() {
+					t.Fatal("session stayed busy after the caller left")
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				transport := &transcriptTransport{steps: test.steps}
+				session := newTestSession(t, transport)
+				fired := make(chan struct{}, 1)
+				session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+				test.settle(t, session)
+
+				for index := 0; index < 64; index++ {
+					transport.enqueue("+CREG: 0,1\r\n")
+				}
+				synctest.Wait()
+				transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+				synctest.Wait()
+				select {
+				case <-fired:
+				default:
+					t.Fatal("readLoop stopped reading the port")
+				}
+			})
+		})
+	}
+}
+
+// Idle bytes must be retained: a partial line whose tail is dropped would make
+// the next command wait for it forever.
+// A half line left in the buffer and its tail read while idle must join in
+// arrival order, or the flush loop waits for a line that never completes.
+func TestSessionIdleBytesAppendInOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{steps: []transportStep{
+			{write: "AT+CSQ\r", chunks: []string{"\r\n+CSQ: 24,99\r\nOK\r\n"}},
+		}}
+		session := newTestSession(t, transport)
+		if _, err := session.Execute(context.Background(), "AT+CSQ"); err != nil {
+			t.Fatalf("setup command failed: %v", err)
+		}
+		synctest.Wait()
+
+		session.readBuf = []byte("+CREG: 0,")
+		transport.enqueue("1\r\n")
+		synctest.Wait()
+
+		transport.steps = append(transport.steps, transportStep{
+			write: "AT\r", chunks: []string{"OK\r\n"},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, err := session.Execute(ctx, "AT"); err != nil {
+			t.Fatalf("Execute after idle tail: %v", err)
+		}
+	})
+}
+
+func TestSessionIdleBytesAreRetained(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{}
+		session := newTestSession(t, transport)
+		for index := 0; index < 16; index++ {
+			transport.enqueue("+CREG: 0,1\r\n")
+		}
+		transport.enqueue("+CUSD: 0,")
+		synctest.Wait()
+
+		session.idleMu.Lock()
+		idle := string(session.idleBuf)
+		session.idleMu.Unlock()
+		if !strings.Contains(idle, "+CUSD: 0,") {
+			t.Fatalf("idle bytes were dropped: %q", idle)
+		}
+	})
+}
+
+func TestSessionWaitURCSurvivesIdleBacklog(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		transport := transportForSession(t, session)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			synctest.Wait()
+			for index := 0; index < 32; index++ {
+				transport.enqueue("+CREG: 0,1\r\n")
+			}
+			transport.enqueue("+CUSD: 0,\"ok\",15\r\n")
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		line, err := session.WaitURC(ctx, func(line string) bool {
+			return strings.HasPrefix(line, "+CUSD:")
+		})
+		if err != nil || !strings.HasPrefix(line, "+CUSD:") {
+			t.Fatalf("URC after idle backlog = %q, %v", line, err)
+		}
+		<-done
+	})
+}
+
+func transportForSession(t *testing.T, session *Session) *transcriptTransport {
+	t.Helper()
+	transport, ok := session.transport.(*transcriptTransport)
+	if !ok {
+		t.Fatalf("session transport = %T, want *transcriptTransport", session.transport)
+	}
+	return transport
+}
+
 func TestSessionCancelsAndClosesBlockedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started, release := make(chan struct{}), make(chan struct{})

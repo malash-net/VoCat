@@ -1119,6 +1119,109 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+const smsArrivalThrottle = 300 * time.Millisecond
+
+// StartSMSArrivalReconciler persists inbound cellular SMS as soon as the modem
+// reports one. StartSMSSyncLoop remains the safety net for firmware that never
+// signals.
+func (s *Server) StartSMSArrivalReconciler(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.smsArrivalOnce.Do(func() {
+		go s.runSMSArrivalReconciler(ctx)
+	})
+}
+
+func (s *Server) runSMSArrivalReconciler(ctx context.Context) {
+	source, ok := s.devices.(cellularSMSArrivalEventController)
+	if !ok {
+		return
+	}
+	events, err := source.SubscribeSMSArrivalEvents(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
+		}
+		return
+	}
+	if events == nil {
+		return
+	}
+	pending := make(map[string]struct{})
+	var throttle <-chan time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			for _, physicalID := range event.DeviceIDs {
+				physicalID = strings.TrimSpace(physicalID)
+				if physicalID == "" {
+					continue
+				}
+				pending[physicalID] = struct{}{}
+				if s.logger != nil {
+					s.logger.Debug("modem reported an inbound SMS indication",
+						"category", "sms", "event", "sms.arrival.indication", "physical_id", physicalID)
+				}
+			}
+			if len(event.DeviceIDs) == 0 {
+				continue
+			}
+			source.ClearSMSArrivalPending(events)
+			if throttle == nil {
+				throttle = time.After(smsArrivalThrottle)
+			}
+		case <-throttle:
+			throttle = nil
+			targets := pending
+			pending = make(map[string]struct{})
+			s.syncModemSMSForPhysicalDevices(ctx, targets)
+		}
+	}
+}
+
+// syncModemSMSForPhysicalDevices scans the configured devices backing the given
+// physical modems, falling back to a full scan so an indication is never
+// silently dropped.
+func (s *Server) syncModemSMSForPhysicalDevices(ctx context.Context, physicalIDs map[string]struct{}) {
+	configs, err := s.store.ListDevices(ctx)
+	if err != nil {
+		s.logger.Warn("list devices for SMS arrival synchronization failed", "error", err)
+		return
+	}
+	// syncModemSMS matches onlyDevice against the stored config ID, while an
+	// indication carries the physical device ID.
+	resolved := make(map[string]struct{}, len(physicalIDs))
+	for _, config := range configs {
+		_, physicalID, present := s.physicalForConfig(config)
+		if !present {
+			continue
+		}
+		if _, wanted := physicalIDs[physicalID]; wanted {
+			resolved[config.ID] = struct{}{}
+		}
+	}
+	if len(resolved) == 0 {
+		s.syncModemSMS(ctx, "")
+		return
+	}
+	for configID := range resolved {
+		if s.logger != nil {
+			s.logger.Info("scanning device after modem SMS indication",
+				"category", "sms", "event", "sms.arrival.scan", "device_id", configID)
+		}
+		s.syncModemSMS(ctx, configID)
+	}
+}
+
 func storedSMSResponse(message store.SMSMessage) map[string]any {
 	body := smsdecode.Preview(message.Body)
 	return map[string]any{

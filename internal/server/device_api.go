@@ -75,6 +75,11 @@ type cellularDeviceLifecycleController interface {
 	SubscribeDeviceLifecycleEvents(context.Context) (<-chan device.DeviceLifecycleEvent, error)
 }
 
+type cellularSMSArrivalEventController interface {
+	SubscribeSMSArrivalEvents(context.Context) (<-chan device.SMSArrivalEvent, error)
+	ClearSMSArrivalPending(<-chan device.SMSArrivalEvent)
+}
+
 type deviceConfigPayload struct {
 	ID                 string `json:"id"`
 	Name               string `json:"name"`

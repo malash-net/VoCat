@@ -161,6 +161,108 @@ func (manager *Manager) publishNetworkStatusEvent(deviceID string) {
 	}
 }
 
+// SMSArrivalEvent reports every physical modem that signalled since the
+// previous event, so a burst across devices is never narrowed to the last one.
+type SMSArrivalEvent struct {
+	DeviceIDs []string
+}
+
+// smsArrivalSubscriber accumulates one subscriber's pending devices. The set is
+// handed over as a whole, so devices cannot displace each other.
+type smsArrivalListener struct {
+	events  chan SMSArrivalEvent
+	pending map[string]struct{}
+}
+
+// SubscribeSMSArrivalEvents subscribes to modem-side new-SMS indications. The
+// event is only a wake-up signal: the consumer scans modem storage, so a
+// spurious signal costs latency at most.
+func (manager *Manager) SubscribeSMSArrivalEvents(ctx context.Context) (<-chan SMSArrivalEvent, error) {
+	if manager == nil {
+		return nil, ErrDataBackendUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	subscriber := &smsArrivalListener{
+		events: make(chan SMSArrivalEvent, 1), pending: make(map[string]struct{}),
+	}
+	manager.smsArrivalMu.Lock()
+	if manager.smsArrivalSubscribers == nil {
+		manager.smsArrivalSubscribers = make(map[*smsArrivalListener]struct{})
+	}
+	manager.smsArrivalSubscribers[subscriber] = struct{}{}
+	manager.smsArrivalMu.Unlock()
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			manager.removeSMSArrivalListener(subscriber)
+		}()
+	}
+	return subscriber.events, nil
+}
+
+func (manager *Manager) removeSMSArrivalListener(subscriber *smsArrivalListener) {
+	manager.smsArrivalMu.Lock()
+	defer manager.smsArrivalMu.Unlock()
+	if _, ok := manager.smsArrivalSubscribers[subscriber]; !ok {
+		return
+	}
+	delete(manager.smsArrivalSubscribers, subscriber)
+	close(subscriber.events)
+}
+
+// publishSMSArrivalEvent reports that one physical modem signalled a new SMS.
+// It runs on the AT session's read goroutine, so it must never block.
+func (manager *Manager) publishSMSArrivalEvent(deviceID string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return
+	}
+	manager.smsArrivalMu.Lock()
+	defer manager.smsArrivalMu.Unlock()
+	for subscriber := range manager.smsArrivalSubscribers {
+		subscriber.pending[deviceID] = struct{}{}
+		// Carry the whole set, replacing any stale queued batch, so a burst
+		// across devices never narrows to the last one.
+		ids := subscriber.peek()
+		select {
+		case subscriber.events <- SMSArrivalEvent{DeviceIDs: ids}:
+			continue
+		default:
+		}
+		select {
+		case <-subscriber.events:
+		default:
+		}
+		select {
+		case subscriber.events <- SMSArrivalEvent{DeviceIDs: ids}:
+		default:
+		}
+	}
+}
+
+// ClearSMSArrivalPending drops devices the consumer has processed, so the set
+// does not grow without bound.
+func (manager *Manager) ClearSMSArrivalPending(events <-chan SMSArrivalEvent) {
+	manager.smsArrivalMu.Lock()
+	defer manager.smsArrivalMu.Unlock()
+	for subscriber := range manager.smsArrivalSubscribers {
+		if subscriber.events == events {
+			subscriber.pending = make(map[string]struct{})
+			return
+		}
+	}
+}
+
+func (subscriber *smsArrivalListener) peek() []string {
+	ids := make([]string, 0, len(subscriber.pending))
+	for id := range subscriber.pending {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // ValidAPN reports whether value can safely be used as a modem PDP-context APN.
 // An empty value is valid and means that the modem/operator default should be used.
 func ValidAPN(value string) bool {

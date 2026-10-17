@@ -24,6 +24,7 @@ type Store struct {
 	logMu        sync.Mutex
 	logClearedAt time.Time
 	logMinLevel  string
+	startupSMSID int64
 }
 
 type Admin struct {
@@ -81,7 +82,18 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return closeOnError(fmt.Errorf("secure sqlite file: %w", err))
 		}
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	// Captured before this process can save a message, so a notifier reading it
+	// on its first tick does not mistake a startup-window arrival for history.
+	s.startupSMSID, err = s.LatestSMSMessageID(ctx)
+	if err != nil {
+		return closeOnError(fmt.Errorf("initialize SMS notification cursor: %w", err))
+	}
+	return s, nil
+}
+
+func (s *Store) StartupSMSMessageID() int64 {
+	return s.startupSMSID
 }
 
 func prepareDatabasePath(path string) error {

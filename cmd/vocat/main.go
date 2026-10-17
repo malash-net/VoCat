@@ -615,6 +615,7 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}
 	go handler.StartLogRetentionLoop(pollContext, time.Minute)
 	go handler.StartSMSSyncLoop(pollContext, 15*time.Second)
+	handler.StartSMSArrivalReconciler(pollContext)
 	handler.StartCellularDataReconciler(pollContext)
 	handler.StartTelegramBot(pollContext)
 	handler.StartSMSNotificationDispatchers(pollContext)

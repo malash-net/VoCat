@@ -50,6 +50,8 @@ type Manager struct {
 	networkEventSubscribers map[chan string]struct{}
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
+	smsArrivalMu            sync.Mutex
+	smsArrivalSubscribers   map[*smsArrivalListener]struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -181,6 +183,7 @@ func NewManager(options Options) (*Manager, error) {
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
+		smsArrivalSubscribers:         make(map[*smsArrivalListener]struct{}),
 
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
@@ -558,8 +561,31 @@ func (manager *Manager) clientLocked(
 	if err != nil {
 		return nil, err
 	}
+	// Only on the open path: a cached client was wired when it was opened, and
+	// closing one stops its events without extra bookkeeping.
+	manager.registerSMSArrivalHandler(candidate.ID, client)
 	state.client = client
 	return client, nil
+}
+
+// smsArrivalSubscriber is the optional capability an AT client implements to
+// report a new-SMS indication.
+type smsArrivalSubscriber interface {
+	SetSMSArrivalHandler(func())
+}
+
+// registerSMSArrivalHandler points a client's new-SMS indication at this
+// manager. Clients without the capability are picked up by the periodic scan.
+// The callback runs on the session's read goroutine, so it only publishes a
+// non-blocking wake-up.
+func (manager *Manager) registerSMSArrivalHandler(deviceID string, client modem.Client) {
+	subscriber, ok := client.(smsArrivalSubscriber)
+	if !ok {
+		return
+	}
+	subscriber.SetSMSArrivalHandler(func() {
+		manager.publishSMSArrivalEvent(deviceID)
+	})
 }
 
 func (manager *Manager) setResult(
