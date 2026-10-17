@@ -51,6 +51,7 @@ type Session struct {
 	urcs      []string
 	pending   *atTransaction
 	poisoned  atomic.Bool
+	busy      atomic.Bool
 
 	// See SetSMSArrivalHandler.
 	smsArrivalHandler atomic.Pointer[func()]
@@ -198,6 +199,12 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	}
 	// Never assign an old reply (including idle input and partial trailing
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
+	session.busy.Store(true)
+	defer func() {
+		if session.pending == nil {
+			session.busy.Store(false)
+		}
+	}()
 	for {
 		session.receivePendingLocked()
 		if session.pending == nil {
@@ -220,6 +227,7 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 		command: command, responsePrefix: expectedResponsePrefix(command), awaitPrompt: interactive,
 	}
 	session.pending = transaction
+	session.busy.Store(true)
 	// Cancellation does not stop the modem. Preserve the caller's deadline and
 	// allow known long commands to finish even when it was shorter than usual.
 	deadline, _ := ctx.Deadline()
@@ -275,10 +283,17 @@ func (session *Session) readLoop() {
 		if err != nil {
 			session.poisoned.Store(true)
 		}
-		select {
-		case session.received <- batch:
-		case <-session.lifetime.Done():
-			return
+		if session.busy.Load() {
+			select {
+			case session.received <- batch:
+			case <-session.lifetime.Done():
+				return
+			}
+		} else {
+			select {
+			case session.received <- batch:
+			default:
+			}
 		}
 		if err != nil {
 			return
@@ -495,6 +510,7 @@ func (session *Session) consumeLineLocked(line string, response *Response) {
 	pending.remainingEcho = nil
 	if isFinalResult(line) || callResult {
 		session.pending = nil
+		session.busy.Store(false)
 		session.recoveryDeadline = time.Time{}
 		if response != nil {
 			response.Final = line
@@ -520,6 +536,8 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 	if session.Poisoned() {
 		return "", ErrSessionClosed
 	}
+	session.busy.Store(true)
+	defer session.busy.Store(false)
 	for {
 		for index, line := range session.urcs {
 			if predicate(line) {

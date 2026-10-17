@@ -409,6 +409,51 @@ func TestSessionSMSArrivalHandlerKeepsTransactionIntact(t *testing.T) {
 	})
 }
 
+func TestSessionSMSArrivalHandlerSurvivesIdleBacklog(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		fired := make(chan struct{}, 1)
+		session.SetSMSArrivalHandler(func() { fired <- struct{}{} })
+		transport := transportForSession(t, session)
+		for index := 0; index < 32; index++ {
+			transport.enqueue("\r\n+CREG: 0,1\r\n")
+		}
+		synctest.Wait()
+		transport.enqueue("\r\n+CMTI: \"SM\",7\r\n")
+		synctest.Wait()
+		select {
+		case <-fired:
+		default:
+			t.Fatal("idle backlog stopped the read loop before +CMTI")
+		}
+	})
+}
+
+func TestSessionWaitURCSurvivesIdleBacklog(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		session := newTestSession(t, &transcriptTransport{})
+		transport := transportForSession(t, session)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			synctest.Wait()
+			for index := 0; index < 32; index++ {
+				transport.enqueue("+CREG: 0,1\r\n")
+			}
+			transport.enqueue("+CUSD: 0,\"ok\",15\r\n")
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		line, err := session.WaitURC(ctx, func(line string) bool {
+			return strings.HasPrefix(line, "+CUSD:")
+		})
+		if err != nil || !strings.HasPrefix(line, "+CUSD:") {
+			t.Fatalf("URC after idle backlog = %q, %v", line, err)
+		}
+		<-done
+	})
+}
+
 func transportForSession(t *testing.T, session *Session) *transcriptTransport {
 	t.Helper()
 	transport, ok := session.transport.(*transcriptTransport)
