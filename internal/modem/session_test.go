@@ -459,6 +459,34 @@ func TestSessionKeepsReadingWithoutConsumer(t *testing.T) {
 
 // Idle bytes must be retained: a partial line whose tail is dropped would make
 // the next command wait for it forever.
+// A half line left in the buffer and its tail read while idle must join in
+// arrival order, or the flush loop waits for a line that never completes.
+func TestSessionIdleBytesAppendInOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := &transcriptTransport{steps: []transportStep{
+			{write: "AT+CSQ\r", chunks: []string{"\r\n+CSQ: 24,99\r\nOK\r\n"}},
+		}}
+		session := newTestSession(t, transport)
+		if _, err := session.Execute(context.Background(), "AT+CSQ"); err != nil {
+			t.Fatalf("setup command failed: %v", err)
+		}
+		synctest.Wait()
+
+		session.readBuf = []byte("+CREG: 0,")
+		transport.enqueue("1\r\n")
+		synctest.Wait()
+
+		transport.steps = append(transport.steps, transportStep{
+			write: "AT\r", chunks: []string{"OK\r\n"},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, err := session.Execute(ctx, "AT"); err != nil {
+			t.Fatalf("Execute after idle tail: %v", err)
+		}
+	})
+}
+
 func TestSessionIdleBytesAreRetained(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		transport := &transcriptTransport{}

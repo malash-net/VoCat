@@ -200,11 +200,12 @@ func (session *Session) executeLocked(ctx context.Context, command string, paylo
 	}
 	// Never assign an old reply (including idle input and partial trailing
 	// lines) to a new command. Flushing cannot isolate bytes still in flight.
-	session.drainIdleLocked()
 	session.setBusy(true)
 	defer session.setBusy(false)
 	for {
 		session.receivePendingLocked()
+		// Idle bytes were read after anything already queued, so they append.
+		session.drainIdleLocked()
 		if session.pending == nil {
 			session.readBuf = bytes.TrimLeft(session.readBuf, "\r\n\x00 \t")
 			if len(session.readBuf) == 0 && session.readErr == nil {
@@ -373,16 +374,14 @@ func (session *Session) bufferIdle(data []byte) {
 	session.idleMu.Unlock()
 }
 
-// drainIdleLocked folds bytes read while idle into the command buffer, keeping
-// their original order ahead of anything received later.
+// drainIdleLocked appends bytes read while idle. They arrived after whatever
+// is already buffered, so they must not be prepended.
 func (session *Session) drainIdleLocked() {
 	session.idleMu.Lock()
 	idle := session.idleBuf
 	session.idleBuf = nil
 	session.idleMu.Unlock()
-	if len(idle) > 0 {
-		session.readBuf = append(idle, session.readBuf...)
-	}
+	session.readBuf = append(session.readBuf, idle...)
 }
 
 // Only one I/O task may run; even after cancellation, later operations wait
