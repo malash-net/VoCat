@@ -364,6 +364,50 @@ func TestSessionReportsIdleURCWithoutCommand(t *testing.T) {
 	})
 }
 
+func TestSessionIdleRecoversAbandonedTransactionAndDispatchesURC(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		first := transportStep{write: "AT+CFUN?\r"}
+		first.result = func() (int, error) { cancel(); return len(first.write), nil }
+		transport := &transcriptTransport{steps: []transportStep{
+			first,
+			{write: "AT+CSQ\r", chunks: []string{"+CSQ: 20,99\r\nOK\r\n"}},
+		}}
+		session := newTestSession(t, transport)
+		var mu sync.Mutex
+		var seen []string
+		session.SetURCHandler(func(line string) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, line)
+		})
+		if _, err := session.Execute(ctx, "AT+CFUN?"); err == nil {
+			t.Fatal("canceled command unexpectedly succeeded")
+		}
+
+		// The abandoned command's late reply arrives together with a new SMS.
+		transport.enqueue("\r\n+CFUN: 1\r\nOK\r\n+CMTI: \"SM\",4\r\n")
+		synctest.Wait()
+		mu.Lock()
+		got := append([]string(nil), seen...)
+		mu.Unlock()
+		if len(got) != 1 || got[0] != `+CMTI: "SM",4` {
+			t.Fatalf("URCs dispatched without a new command = %q", got)
+		}
+		session.gate <- struct{}{}
+		pending := session.pending
+		session.unlock()
+		if pending != nil {
+			t.Fatalf("abandoned transaction %q was not recovered", pending.command)
+		}
+
+		response, err := session.Execute(context.Background(), "AT+CSQ")
+		if err != nil || response.Text() != "+CSQ: 20,99" || len(response.URCs) != 0 {
+			t.Fatalf("late reply leaked into next command: %#v, %v", response, err)
+		}
+	})
+}
+
 func TestSessionCancelsAndClosesBlockedWrite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started, release := make(chan struct{}), make(chan struct{})
