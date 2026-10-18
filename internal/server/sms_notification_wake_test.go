@@ -4,12 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
-	"testing/fstest"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
-	"vocat/internal/auth"
 	"vocat/internal/store"
 )
 
@@ -37,19 +33,7 @@ func TestSMSNotificationDeliversStartupWindowArrival(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	authService, err := auth.New(database, auth.Options{SessionTTL: time.Hour, BcryptCost: bcrypt.MinCost})
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := New(Options{
-		Store:               database,
-		Auth:                authService,
-		Assets:              fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}},
-		MaxRequestBodyBytes: 1 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := &Server{store: database, logger: regionTestLogger()}
 	if err := database.UpsertNotificationSetting(ctx, store.NotificationSetting{
 		Channel:         "webhook",
 		Enabled:         true,

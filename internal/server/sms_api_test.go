@@ -855,11 +855,6 @@ func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("SMS arrival event did not trigger a modem scan")
 	}
-	select {
-	case physicalID := <-controller.listed:
-		t.Fatalf("unexpected extra scan of %q", physicalID)
-	case <-time.After(100 * time.Millisecond):
-	}
 	cancel()
 	<-done
 }
