@@ -682,9 +682,16 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			continue
 		}
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
-		// ListSMS re-asserts AT+CNMI on every scan: firmware such as the
-		// OpenStick 410 resets it after a profile switch, which would otherwise
-		// leave newly delivered SMS invisible or unannounced.
+		// Store new SMS and announce them with +CMTI, which wakes the sync loop.
+		// Re-applied on every scan because firmware can reset CNMI after a
+		// reboot or profile switch (OpenStick 410 does), which would leave newly
+		// delivered SMS invisible or unannounced.
+		setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
+		_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
+		cancelSetup()
+		if setupErr != nil {
+			s.logger.Debug("cellular SMS notification setup skipped", "device_id", config.ID, "error", setupErr)
+		}
 		listContext, cancelList := context.WithTimeout(ctx, 30*time.Second)
 		listing, err := s.devices.ListSMS(listContext, physicalID)
 		cancelList()
