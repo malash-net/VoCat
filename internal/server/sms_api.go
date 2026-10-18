@@ -682,10 +682,8 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			continue
 		}
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
-		// Store new SMS and announce them with +CMTI, which wakes the sync loop.
-		// Re-applied on every scan because firmware can reset CNMI after a
-		// reboot or profile switch (OpenStick 410 does), which would leave newly
-		// delivered SMS invisible or unannounced.
+		// Store new SMS and announce them with +CMTI. Re-applied every scan:
+		// firmware (e.g. OpenStick 410) can reset CNMI after a profile switch.
 		setupContext, cancelSetup := context.WithTimeout(ctx, 5*time.Second)
 		_, setupErr := s.devices.ExecuteAT(setupContext, physicalID, `AT+CNMI=2,1,0,0,0`)
 		cancelSetup()
@@ -723,10 +721,8 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		concatSources := modemSMSConcatSources(messages)
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
-		// Multipart groups are keyed by the slot of their first segment as seen
-		// in this scan, so deleting a segment before the row is complete would
-		// give later segments a different message ID and leave both halves
-		// unmerged forever. Hold every segment until its row is complete.
+		// Multipart IDs derive from the first segment's slot in this scan, so
+		// keep every segment in storage until its row is complete.
 		concatSlots := make(map[string][]modemSMSSlot)
 		concatComplete := make(map[string]bool)
 		for _, message := range messages {
@@ -1119,11 +1115,10 @@ type cellularSMSArrivalSource interface {
 }
 
 // StartSMSSyncLoop persists inbound cellular SMS even when no client has the
-// SMS page open. A +CMTI indication from any modem triggers an immediate scan;
-// the periodic tick remains the safety net for modems that do not announce
-// new messages. The first tick is delayed so startup SIM/AKA work gets
-// exclusive use of the modem. Stable VoWiFi sessions still scan SM and ME as a
-// catch-up path for messages delivered while the card was offline.
+// SMS page open. A +CMTI from any modem triggers an immediate scan; the
+// periodic tick is the safety net. The first tick is delayed so startup
+// SIM/AKA work gets exclusive use of the modem. Stable VoWiFi sessions still
+// scan SM and ME as a catch-up path for messages delivered while offline.
 func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
@@ -1141,9 +1136,7 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
 		case <-arrivals:
-			// +CMTI follows the write to storage. An indication arriving during
-			// this scan, such as a later multipart segment, stays buffered and
-			// triggers another pass.
+			// One arriving during the scan stays buffered for another pass.
 			s.syncModemSMS(ctx, "")
 		}
 	}

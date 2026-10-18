@@ -25,13 +25,9 @@ type Store struct {
 	logClearedAt time.Time
 	logMinLevel  string
 
-	// startupSMSID is MAX(sms_messages.id) when this process opened the
-	// database, the cursor notification consumers start from.
-	startupSMSID int64
-	// smsInserted is closed and replaced whenever an SMS row receives a new
-	// durable id, waking notification consumers without polling.
+	startupSMSID  int64 // see StartupSMSMessageID
 	smsInsertedMu sync.Mutex
-	smsInserted   chan struct{}
+	smsInserted   chan struct{} // see SMSInserted
 }
 
 type Admin struct {
@@ -90,9 +86,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		}
 	}
 	s := &Store{db: db}
-	// Capture the cursor before this process can save a message. A consumer
-	// that read MAX(id) on its own first tick would treat an SMS that arrived
-	// during startup as history and never notify it.
+	// Captured before this process can save an SMS; see StartupSMSMessageID.
 	if s.startupSMSID, err = s.LatestSMSMessageID(ctx); err != nil {
 		return closeOnError(err)
 	}

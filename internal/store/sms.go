@@ -19,7 +19,7 @@ type contextQueryExecer interface {
 // SaveSMSMessage inserts a new message or updates an existing record. A
 // non-empty (device_id, message_id) pair is idempotent for modem retries.
 func (s *Store) SaveSMSMessage(ctx context.Context, value SMSMessage) (SMSMessage, error) {
-	result, err := s.saveSMSMessageTransaction(ctx, value, false)
+	result, err := s.SaveSMSMessageWithResult(ctx, value)
 	return result.Message, err
 }
 
@@ -35,15 +35,8 @@ type SMSMessageSaveResult struct {
 // Callers that emit one-shot events should use Inserted instead of comparing
 // timestamps: timestamps are stored with one-second precision and unchanged
 // concatenated-message rescans can legitimately retain equal timestamps.
+// Every new row also wakes SMSInserted consumers.
 func (s *Store) SaveSMSMessageWithResult(ctx context.Context, value SMSMessage) (SMSMessageSaveResult, error) {
-	return s.saveSMSMessageTransaction(ctx, value, true)
-}
-
-func (s *Store) saveSMSMessageTransaction(
-	ctx context.Context,
-	value SMSMessage,
-	detectInsertion bool,
-) (SMSMessageSaveResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return SMSMessageSaveResult{}, fmt.Errorf("begin SMS update: %w", err)
@@ -64,21 +57,17 @@ func (s *Store) saveSMSMessageTransaction(
 	if inserted {
 		s.signalSMSInserted()
 	}
-	return SMSMessageSaveResult{
-		Message:  saved,
-		Inserted: detectInsertion && inserted,
-	}, nil
+	return SMSMessageSaveResult{Message: saved, Inserted: inserted}, nil
 }
 
-// StartupSMSMessageID returns MAX(id) as of Open, so notification consumers
-// started after Open still see every SMS this process saved.
+// StartupSMSMessageID returns MAX(id) as of Open: the cursor notification
+// consumers start from, so none skips an SMS saved during startup.
 func (s *Store) StartupSMSMessageID() int64 {
 	return s.startupSMSID
 }
 
-// SMSInserted returns a channel that is closed the next time an SMS row
-// receives a new durable id (a new message, or a multipart message that
-// advanced). Fetch it before reading the cursor so no insertion is missed.
+// SMSInserted returns a channel closed when the next SMS row gets a new id.
+// Fetch it before reading the cursor so no insertion is missed.
 func (s *Store) SMSInserted() <-chan struct{} {
 	s.smsInsertedMu.Lock()
 	defer s.smsInsertedMu.Unlock()

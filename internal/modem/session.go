@@ -24,9 +24,8 @@ type SessionOptions struct {
 	ReadTimeout    time.Duration
 	CommandTimeout time.Duration
 	MaxURCs        int
-	// OnURC, when set, is called for every unsolicited result as soon as it is
-	// parsed, whether it arrived during a command or while the port was idle.
-	// It runs with the session lock held: it must not block or issue commands.
+	// OnURC is called for each URC as it is parsed, including while idle. It
+	// runs with the session lock held: it must not block or issue commands.
 	OnURC func(string)
 }
 
@@ -288,8 +287,8 @@ func (session *Session) readLoop() {
 }
 
 // idleLoop parses input that arrives while no command owns the port, so URCs
-// such as +CMTI reach the handler immediately instead of waiting for the next
-// command's pre-write drain.
+// such as +CMTI reach OnURC immediately. A transaction abandoned by a timed-out
+// caller, or its unfinished write, is left to the next command to recover.
 func (session *Session) idleLoop() {
 	for {
 		select {
@@ -300,26 +299,13 @@ func (session *Session) idleLoop() {
 		if err := session.lock(session.lifetime); err != nil {
 			return
 		}
-		session.consumeIdleLocked()
-		session.unlock()
-	}
-}
-
-// consumeIdleLocked parses complete lines while no caller owns the port. A
-// transaction abandoned by a timed-out or cancelled caller, or its unfinished
-// write, is left to the next command, which already knows how to recover it;
-// until then idle URCs wait for that command as they did before.
-func (session *Session) consumeIdleLocked() {
-	if session.Poisoned() || session.pending != nil || session.ioDone != nil {
-		return
-	}
-	session.receivePendingLocked()
-	for {
-		line, ok := popLine(&session.readBuf)
-		if !ok {
-			return
+		if !session.Poisoned() && session.pending == nil && session.ioDone == nil {
+			session.receivePendingLocked()
+			for line, ok := popLine(&session.readBuf); ok; line, ok = popLine(&session.readBuf) {
+				session.consumeLineLocked(line, nil)
+			}
 		}
-		session.consumeLineLocked(line, nil)
+		session.unlock()
 	}
 }
 
