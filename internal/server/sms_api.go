@@ -1142,12 +1142,6 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if source, ok := s.devices.(cellularSMSArrivalSource); ok {
 		arrivals = source.SMSArrivals()
 	}
-	scan := func(trigger string) {
-		started := time.Now()
-		s.syncModemSMS(ctx, "")
-		s.logger.Debug("modem SMS scan finished",
-			"category", "sms", "trigger", trigger, "duration", time.Since(started))
-	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1155,10 +1149,13 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scan("tick")
+			s.syncModemSMS(ctx, "")
 		case <-arrivals:
 			// One arriving during the scan stays buffered for another pass.
-			scan("cmti")
+			started := time.Now()
+			s.syncModemSMS(ctx, "")
+			s.logger.Debug("modem SMS scan after +CMTI finished",
+				"category", "sms", "duration", time.Since(started))
 		}
 	}
 }
