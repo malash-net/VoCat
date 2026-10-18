@@ -881,8 +881,9 @@ func TestSyncModemSMSKeepsIncompleteMultipartSegmentsUntilMerged(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Recent enough to stay within modemSMSIncompleteHoldLimit.
-	receivedAt := time.Now().UTC().Truncate(time.Second)
+	// An old SCTS must not expire the hold: it counts from when VoCat first
+	// stored the group.
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
 	segment := func(index, sequence int, body string) device.SMSMessage {
 		return device.SMSMessage{
 			Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
@@ -956,8 +957,11 @@ func TestSyncModemSMSClearsStaleIncompleteMultipart(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The carrier lost segment 2; segment 1 must not hold its slot forever.
-	receivedAt := time.Now().UTC().Add(-modemSMSIncompleteHoldLimit - time.Hour)
+	// The carrier lost segment 2; segment 1 must not hold its slot forever,
+	// even when its SCTS failed to decode.
+	previousLimit := modemSMSIncompleteHoldLimit
+	modemSMSIncompleteHoldLimit = -time.Second
+	t.Cleanup(func() { modemSMSIncompleteHoldLimit = previousLimit })
 	controller := &smsDeletionController{
 		fakeDeviceController: fakeDeviceController{entry: device.Device{
 			ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{DeviceID: deviceID},
@@ -965,9 +969,9 @@ func TestSyncModemSMSClearsStaleIncompleteMultipart(t *testing.T) {
 		storedMessages: []device.SMSMessage{{
 			Index: 3, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
 			Direction: device.SMSDirectionReceived, From: "+447700900123", Text: "part one ",
-			Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &receivedAt,
-			Concat: &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: 1},
-			RawPDU: "SM-part-one",
+			Encoding: device.SMSEncodingGSM7PDU,
+			Concat:   &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: 1},
+			RawPDU:   "SM-part-one",
 		}},
 	}
 	server := &Server{store: database, logger: regionTestLogger(), devices: controller}

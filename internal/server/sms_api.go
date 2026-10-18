@@ -728,7 +728,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		// modemSMSIncompleteHoldLimit shows a lost segment will never arrive.
 		concatSlots := make(map[string][]modemSMSSlot)
 		concatComplete := make(map[string]bool)
-		concatOldest := make(map[string]time.Time)
+		concatFirstSeen := make(map[string]time.Time)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -814,9 +814,9 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				if message.Concat != nil && message.Concat.Total > 1 {
 					concatSlots[messageID] = appendModemSMSSlot(concatSlots[messageID], message)
 					concatComplete[messageID] = store.ConcatSMSReadyToNotify(saveResult.Message.MessageID, saveResult.Message.Extra)
-					if oldest, seen := concatOldest[messageID]; !seen || timestamp.Before(oldest) {
-						concatOldest[messageID] = timestamp
-					}
+					// CreatedAt is when VoCat first stored this group, kept across
+					// merges and rescans; unlike SCTS it is never missing or skewed.
+					concatFirstSeen[messageID] = saveResult.Message.CreatedAt
 				} else {
 					clearSlots = appendModemSMSSlot(clearSlots, message)
 				}
@@ -835,10 +835,10 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			for messageID, slots := range concatSlots {
 				if concatComplete[messageID] {
 					clearSlots = append(clearSlots, slots...)
-				} else if time.Since(concatOldest[messageID]) > modemSMSIncompleteHoldLimit {
+				} else if time.Since(concatFirstSeen[messageID]) > modemSMSIncompleteHoldLimit {
 					s.logger.Info("clearing incomplete multipart SMS from modem storage",
 						"category", "sms", "device_id", config.ID, "segments", len(slots),
-						"oldest", concatOldest[messageID])
+						"first_seen", concatFirstSeen[messageID])
 					clearSlots = append(clearSlots, slots...)
 				}
 			}
@@ -1123,9 +1123,10 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 }
 
 // modemSMSIncompleteHoldLimit bounds how long segments of an incomplete
-// multipart SMS occupy modem storage, so a segment the carrier lost cannot
-// fill the limited slots forever.
-const modemSMSIncompleteHoldLimit = 24 * time.Hour
+// multipart SMS occupy modem storage after VoCat first stored them, so a
+// segment the carrier lost cannot fill the limited slots forever. A variable
+// so tests can expire it.
+var modemSMSIncompleteHoldLimit = 24 * time.Hour
 
 type cellularSMSArrivalSource interface {
 	SMSArrivals() <-chan struct{}
