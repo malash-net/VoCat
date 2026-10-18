@@ -181,6 +181,12 @@ func (manager *Manager) ListSMS(
 	listing := SMSListing{}
 	var lastErr error
 	listed := false
+	logSkipped := func(storage, command string, err error) {
+		if manager.logger != nil {
+			manager.logger.Debug("modem SMS storage skipped while listing",
+				"device_id", id, "storage", storage, "command", command, "error", err)
+		}
+	}
 	for _, storage := range smsListStorages {
 		// Select this storage for reading (mem1 only, so send/receive routing is
 		// untouched). An unsupported storage reports an error; skip it rather than
@@ -192,6 +198,7 @@ func (manager *Manager) ListSMS(
 		)
 		if err != nil {
 			lastErr = err
+			logSkipped(storage, "AT+CPMS", err)
 			continue
 		}
 		if area, ok := parseSelectedCPMSUsage(response); ok {
@@ -205,6 +212,7 @@ func (manager *Manager) ListSMS(
 		response, err = manager.command(ctx, client, "AT+CMGL=4")
 		if err != nil {
 			lastErr = err
+			logSkipped(storage, "AT+CMGL", err)
 			continue
 		}
 		listed = true

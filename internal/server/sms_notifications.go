@@ -220,6 +220,8 @@ func (s *Server) deliverSMSNotificationsOnce(
 					}
 					break
 				}
+				s.logger.Debug("SMS notification sent",
+					"category", "sms", "channel", channel, "sms_id", message.ID)
 				state.id = message.ID
 				state.lastError = ""
 				state.consecutiveFailures = 0

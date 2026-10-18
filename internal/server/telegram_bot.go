@@ -2319,6 +2319,10 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 						bot.warn("send Telegram SMS notification", sendErr)
 						break
 					}
+					if bot.server.logger != nil {
+						bot.server.logger.Debug("SMS notification sent",
+							"category", "sms", "channel", "telegram", "sms_id", message.ID)
+					}
 					cursor = message.ID
 				}
 			}
