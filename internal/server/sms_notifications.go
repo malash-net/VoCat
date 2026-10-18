@@ -145,14 +145,22 @@ func (state *smsNotificationCursor) logError(server *Server, channel string, err
 // retry policy can be tested without reaching a real provider.
 type smsNotificationSender func(context.Context, string, map[string]any, smsNotification) error
 
-// runSMSNotificationChannel polls one notification channel until ctx is
-// cancelled, sleeping for the delay returned by each scheduling tick so a
-// failing provider backs off instead of being retried every two seconds.
+// runSMSNotificationChannel runs one notification channel until ctx is
+// cancelled. A newly stored inbound SMS wakes it immediately; otherwise it
+// sleeps for the delay returned by each scheduling tick. While a provider is
+// failing, only that delay applies so it backs off instead of being retried
+// on every incoming message.
 func (s *Server) runSMSNotificationChannel(ctx context.Context, channel string) {
 	state := &smsNotificationCursor{}
 	for ctx.Err() == nil {
+		// Taken before the tick reads the cursor, so an insertion during the
+		// tick still wakes the next one.
+		inserted := s.store.SMSInserted()
 		delay := s.deliverSMSNotificationsOnce(ctx, channel, state, sendSMSNotification)
-		if !waitTelegram(ctx, delay) {
+		if state.consecutiveFailures > 0 {
+			inserted = nil
+		}
+		if !waitSMSInserted(ctx, delay, inserted) {
 			return
 		}
 	}
@@ -167,13 +175,9 @@ func (s *Server) deliverSMSNotificationsOnce(
 	send smsNotificationSender,
 ) time.Duration {
 	if !state.initialized {
-		latest, err := s.store.LatestSMSMessageID(ctx)
-		if err != nil {
-			state.logError(s, channel, err)
-			return smsNotificationPollInterval
-		}
-		state.id, state.initialized = latest, true
-		state.lastError = ""
+		// Reading MAX(id) here would skip an SMS stored between Open and this
+		// first tick.
+		state.id, state.initialized = s.store.StartupSMSMessageID(), true
 	}
 	config, enabled, configErr := s.smsNotificationConfig(ctx, channel)
 	if configErr != nil {

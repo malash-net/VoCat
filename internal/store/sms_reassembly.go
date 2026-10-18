@@ -116,28 +116,6 @@ func mergeConcatSegment(
 	normalizeCumulativeConcatParts(parts)
 	changed = !maps.Equal(previousParts, parts)
 
-	// concat_part_keys records which physical segment delivery filled each
-	// sequence, so ResolveConcatSMSGroup can map a rescanned segment back to
-	// this row without relying on modem storage slots.
-	partKeys := map[string]string{}
-	if len(existingExtra) > 0 {
-		if existing, derr := decodeJSONObject(existingExtra); derr == nil {
-			if stored, ok := existing["concat_part_keys"].(map[string]any); ok {
-				for key, value := range stored {
-					if text, ok := value.(string); ok {
-						partKeys[key] = text
-					}
-				}
-			}
-		}
-	}
-	if partKey, _ := segment["concat_part_key"].(string); partKey != "" {
-		if partKeys[strconv.Itoa(sequence)] != partKey {
-			partKeys[strconv.Itoa(sequence)] = partKey
-			changed = true
-		}
-	}
-
 	sequences := make([]int, 0, len(parts))
 	for n := range parts {
 		sequences = append(sequences, n)
@@ -157,9 +135,6 @@ func mergeConcatSegment(
 		"concat_parts":    stored,
 		"concat_received": len(parts),
 		"concat_complete": complete,
-	}
-	if len(partKeys) > 0 {
-		merged["concat_part_keys"] = partKeys
 	}
 	// Preserve non-concat metadata from the latest segment for context.
 	for _, key := range []string{"encoding", "storage", "transport", "source", "keep_durable_id_on_rescan"} {

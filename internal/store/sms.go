@@ -49,11 +49,9 @@ func (s *Store) saveSMSMessageTransaction(
 		return SMSMessageSaveResult{}, fmt.Errorf("begin SMS update: %w", err)
 	}
 	defer tx.Rollback()
-	var previousMaxID int64
-	if detectInsertion {
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sms_messages`).Scan(&previousMaxID); err != nil {
-			return SMSMessageSaveResult{}, fmt.Errorf("read SMS insertion cursor: %w", err)
-		}
+	previousMaxID, err := readSMSInsertionCursor(ctx, tx)
+	if err != nil {
+		return SMSMessageSaveResult{}, err
 	}
 	saved, err := saveSMSMessage(ctx, tx, value)
 	if err != nil {
@@ -62,10 +60,53 @@ func (s *Store) saveSMSMessageTransaction(
 	if err := tx.Commit(); err != nil {
 		return SMSMessageSaveResult{}, fmt.Errorf("commit SMS update: %w", err)
 	}
+	inserted := saved.ID > previousMaxID
+	if inserted && isInboundSMSDirection(saved.Direction) {
+		s.signalSMSInserted()
+	}
 	return SMSMessageSaveResult{
 		Message:  saved,
-		Inserted: detectInsertion && saved.ID > previousMaxID,
+		Inserted: detectInsertion && inserted,
 	}, nil
+}
+
+func readSMSInsertionCursor(ctx context.Context, executor contextQueryExecer) (int64, error) {
+	var id int64
+	if err := executor.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sms_messages`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("read SMS insertion cursor: %w", err)
+	}
+	return id, nil
+}
+
+func isInboundSMSDirection(direction string) bool {
+	return direction == "inbound" || direction == "received"
+}
+
+// StartupSMSMessageID returns MAX(id) as of Open, so notification consumers
+// started after Open still see every SMS this process saved.
+func (s *Store) StartupSMSMessageID() int64 {
+	return s.startupSMSID
+}
+
+// SMSInserted returns a channel that is closed the next time an inbound SMS
+// row receives a new durable id (a new message, or a multipart message that
+// advanced). Fetch it before reading the cursor so no insertion is missed.
+func (s *Store) SMSInserted() <-chan struct{} {
+	s.smsInsertedMu.Lock()
+	defer s.smsInsertedMu.Unlock()
+	if s.smsInserted == nil {
+		s.smsInserted = make(chan struct{})
+	}
+	return s.smsInserted
+}
+
+func (s *Store) signalSMSInserted() {
+	s.smsInsertedMu.Lock()
+	defer s.smsInsertedMu.Unlock()
+	if s.smsInserted != nil {
+		close(s.smsInserted)
+	}
+	s.smsInserted = make(chan struct{})
 }
 
 func saveSMSMessage(
@@ -338,13 +379,23 @@ func (s *Store) SaveSMSMessages(ctx context.Context, values []SMSMessage) error 
 		return fmt.Errorf("begin SMS batch: %w", err)
 	}
 	defer tx.Rollback()
+	previousMaxID, err := readSMSInsertionCursor(ctx, tx)
+	if err != nil {
+		return err
+	}
+	notify := false
 	for index, value := range values {
-		if _, err := saveSMSMessage(ctx, tx, value); err != nil {
+		saved, err := saveSMSMessage(ctx, tx, value)
+		if err != nil {
 			return fmt.Errorf("save SMS batch item %d: %w", index, err)
 		}
+		notify = notify || (saved.ID > previousMaxID && isInboundSMSDirection(saved.Direction))
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit SMS batch: %w", err)
+	}
+	if notify {
+		s.signalSMSInserted()
 	}
 	return nil
 }

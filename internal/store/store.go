@@ -24,6 +24,14 @@ type Store struct {
 	logMu        sync.Mutex
 	logClearedAt time.Time
 	logMinLevel  string
+
+	// startupSMSID is MAX(sms_messages.id) when this process opened the
+	// database, the cursor notification consumers start from.
+	startupSMSID int64
+	// smsInserted is closed and replaced whenever an inbound SMS row receives
+	// a new durable id, waking notification consumers without polling.
+	smsInsertedMu sync.Mutex
+	smsInserted   chan struct{}
 }
 
 type Admin struct {
@@ -81,7 +89,14 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return closeOnError(fmt.Errorf("secure sqlite file: %w", err))
 		}
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	// Capture the cursor before this process can save a message. A consumer
+	// that read MAX(id) on its own first tick would treat an SMS that arrived
+	// during startup as history and never notify it.
+	if s.startupSMSID, err = s.LatestSMSMessageID(ctx); err != nil {
+		return closeOnError(err)
+	}
+	return s, nil
 }
 
 func prepareDatabasePath(path string) error {

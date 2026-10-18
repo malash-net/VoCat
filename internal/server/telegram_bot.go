@@ -2289,23 +2289,16 @@ func (bot *telegramBot) sendSMSNotification(ctx context.Context, config telegram
 }
 
 func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
-	cursorInitialized := false
-	var cursor int64
+	// Reading MAX(id) on the first tick would skip an SMS stored since Open.
+	cursor := bot.server.store.StartupSMSMessageID()
 	for ctx.Err() == nil {
-		if !cursorInitialized {
-			latest, err := bot.server.store.LatestSMSMessageID(ctx)
-			if err != nil {
-				bot.warn("initialize Telegram SMS cursor", err)
-				if !waitTelegram(ctx, telegramNotificationPeriod) {
-					return
-				}
-				continue
-			}
-			cursor, cursorInitialized = latest, true
-		}
+		// Taken before reading the cursor so an insertion during this pass
+		// still wakes the next one. Failures fall back to the fixed period.
+		inserted := bot.server.store.SMSInserted()
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
 			bot.warn("load Telegram SMS notification configuration", err)
+			inserted = nil
 		} else if !enabled {
 			if latest, latestErr := bot.server.store.LatestSMSMessageID(ctx); latestErr == nil {
 				cursor = latest
@@ -2314,6 +2307,7 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 			messages, listErr := bot.server.store.ListInboundSMSAfterID(ctx, cursor, 100)
 			if listErr != nil {
 				bot.warn("list Telegram SMS notifications", listErr)
+				inserted = nil
 			} else {
 				for _, message := range messages {
 					if !smsMessageReadyToNotify(message) {
@@ -2325,13 +2319,14 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 					}
 					if sendErr := bot.sendSMSNotification(ctx, config, message); sendErr != nil {
 						bot.warn("send Telegram SMS notification", sendErr)
+						inserted = nil
 						break
 					}
 					cursor = message.ID
 				}
 			}
 		}
-		if !waitTelegram(ctx, telegramNotificationPeriod) {
+		if !waitSMSInserted(ctx, telegramNotificationPeriod, inserted) {
 			return
 		}
 	}
@@ -2632,6 +2627,21 @@ func tailDigits(value string, count int) string {
 		return value
 	}
 	return value[len(value)-count:]
+}
+
+// waitSMSInserted is waitTelegram that also returns early when inserted is
+// closed. A nil inserted channel waits for the full duration.
+func waitSMSInserted(ctx context.Context, duration time.Duration, inserted <-chan struct{}) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-inserted:
+		return true
+	case <-timer.C:
+		return true
+	}
 }
 
 func waitTelegram(ctx context.Context, duration time.Duration) bool {

@@ -1,0 +1,88 @@
+package server
+
+import (
+	"context"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"vocat/internal/auth"
+	"vocat/internal/store"
+)
+
+// An SMS stored after Open but before a dispatcher's first tick (the modem
+// sync loop can run first during startup) must still be notified.
+func TestSMSNotificationDeliversStartupWindowArrival(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	authService, err := auth.New(database, auth.Options{SessionTTL: time.Hour, BcryptCost: bcrypt.MinCost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Options{
+		Store:               database,
+		Auth:                authService,
+		Assets:              fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}},
+		MaxRequestBodyBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertNotificationSetting(ctx, store.NotificationSetting{
+		Channel:         "webhook",
+		Enabled:         true,
+		Config:          []byte(`{"urls":["https://example.com/hook"]}`),
+		SensitiveFields: store.DefaultNotificationSensitiveFields("webhook"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SaveSMSMessage(ctx, store.SMSMessage{
+		DeviceID: "device-1", Peer: "+12025550123", Direction: "inbound",
+		Body: "arrived during startup", Timestamp: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []string
+	sender := func(_ context.Context, _ string, _ map[string]any, notification smsNotification) error {
+		delivered = append(delivered, notification.Content)
+		return nil
+	}
+	server.deliverSMSNotificationsOnce(ctx, "webhook", &smsNotificationCursor{}, sender)
+	if len(delivered) != 1 || delivered[0] != "arrived during startup" {
+		t.Fatalf("delivered = %q, want the startup-window SMS", delivered)
+	}
+}
+
+func TestWaitSMSInsertedReturnsOnInsertion(t *testing.T) {
+	inserted := make(chan struct{})
+	close(inserted)
+	started := time.Now()
+	if !waitSMSInserted(context.Background(), time.Minute, inserted) {
+		t.Fatal("waitSMSInserted reported cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("waitSMSInserted ignored the insertion signal for %v", elapsed)
+	}
+
+	// A nil channel (provider backing off) waits for the full delay.
+	started = time.Now()
+	if !waitSMSInserted(context.Background(), 50*time.Millisecond, nil) {
+		t.Fatal("waitSMSInserted reported cancellation")
+	}
+	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
+		t.Fatalf("waitSMSInserted returned after %v, before its delay", elapsed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitSMSInserted(ctx, time.Minute, nil) {
+		t.Fatal("waitSMSInserted ignored cancellation")
+	}
+}
