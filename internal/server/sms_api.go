@@ -1124,9 +1124,8 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 
 // modemSMSIncompleteHoldLimit bounds how long segments of an incomplete
 // multipart SMS occupy modem storage after VoCat first stored them, so a
-// segment the carrier lost cannot fill the limited slots forever. A variable
-// so tests can expire it.
-var modemSMSIncompleteHoldLimit = 24 * time.Hour
+// segment the carrier lost cannot fill the limited slots forever.
+const modemSMSIncompleteHoldLimit = 24 * time.Hour
 
 type cellularSMSArrivalSource interface {
 	SMSArrivals() <-chan struct{}

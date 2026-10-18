@@ -344,3 +344,42 @@ func TestSaveConcatSMSFoldsSegmentsIntoOneRow(t *testing.T) {
 		t.Fatalf("rows after rescan = %d, %v; want still 1", len(count), err)
 	}
 }
+
+// The incomplete-multipart storage hold counts from CreatedAt, so a segment
+// that advances the group (delete and reinsert under a new id) must keep it.
+func TestConcatSMSKeepsCreatedAtWhenSegmentAdvancesGroup(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		peer     = "+447700900123"
+	)
+	messageID := StableConcatMessageID("cellular_at", "", deviceID, peer, 41, 2)
+	firstSeen := time.Unix(1_700_000_000, 0).UTC()
+	first, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: messageID, DeviceID: deviceID, Peer: peer, Direction: "inbound",
+		Body: "part one ", Source: "cellular_at", PartsTotal: 2,
+		Extra: concatExtra(t, 41, 2, 1), CreatedAt: firstSeen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: messageID, DeviceID: deviceID, Peer: peer, Direction: "inbound",
+		Body: "part two", Source: "cellular_at", PartsTotal: 2,
+		Extra: concatExtra(t, 41, 2, 2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || !ConcatSMSReadyToNotify(second.MessageID, second.Extra) {
+		t.Fatalf("second segment did not advance the group: first=%d second=%d", first.ID, second.ID)
+	}
+	if !second.CreatedAt.Equal(firstSeen) {
+		t.Fatalf("CreatedAt = %v after reinsert, want first-seen %v", second.CreatedAt, firstSeen)
+	}
+}

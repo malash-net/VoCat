@@ -951,28 +951,42 @@ func TestSyncModemSMSClearsStaleIncompleteMultipart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	const deviceID = "ec20-1"
+	const (
+		deviceID = "ec20-1"
+		peer     = "+447700900123"
+	)
 	if err := database.UpsertDevice(ctx, store.Device{
 		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25, SMSEnabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The carrier lost segment 2; segment 1 must not hold its slot forever,
-	// even when its SCTS failed to decode.
-	previousLimit := modemSMSIncompleteHoldLimit
-	modemSMSIncompleteHoldLimit = -time.Second
-	t.Cleanup(func() { modemSMSIncompleteHoldLimit = previousLimit })
+	// The carrier lost segment 2 and segment 1's SCTS failed to decode. VoCat
+	// first stored the group longer ago than the default hold limit.
+	segment := device.SMSMessage{
+		Index: 3, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: peer, Text: "part one ",
+		Encoding: device.SMSEncodingGSM7PDU,
+		Concat:   &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: 1},
+		RawPDU:   "SM-part-one",
+	}
+	concatSource := modemSMSConcatSources([]device.SMSMessage{segment})[modemSMSStorageKey(segment)]
+	extra, err := json.Marshal(map[string]any{"concat": segment.Concat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SaveSMSMessage(ctx, store.SMSMessage{
+		MessageID: modemSMSMessageID(segment, "", deviceID, peer, concatSource),
+		DeviceID:  deviceID, Peer: peer, Direction: "inbound", Body: segment.Text,
+		Source: "cellular_at", PartsTotal: 2, Extra: extra,
+		CreatedAt: time.Now().Add(-modemSMSIncompleteHoldLimit - time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	controller := &smsDeletionController{
 		fakeDeviceController: fakeDeviceController{entry: device.Device{
 			ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{DeviceID: deviceID},
 		}},
-		storedMessages: []device.SMSMessage{{
-			Index: 3, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
-			Direction: device.SMSDirectionReceived, From: "+447700900123", Text: "part one ",
-			Encoding: device.SMSEncodingGSM7PDU,
-			Concat:   &device.SMSConcatInfo{Reference: 41, Total: 2, Sequence: 1},
-			RawPDU:   "SM-part-one",
-		}},
+		storedMessages: []device.SMSMessage{segment},
 	}
 	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
 
@@ -988,6 +1002,6 @@ func TestSyncModemSMSClearsStaleIncompleteMultipart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(stored) != 1 || store.ConcatSMSReadyToNotify(stored[0].MessageID, stored[0].Extra) {
-		t.Fatalf("stored messages = %#v, want the incomplete row kept and not notifiable", stored)
+		t.Fatalf("stored messages = %#v, want one incomplete, non-notifiable row", stored)
 	}
 }
