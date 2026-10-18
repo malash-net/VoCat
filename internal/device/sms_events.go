@@ -1,10 +1,6 @@
 package device
 
-import (
-	"strings"
-
-	"vocat/internal/modem"
-)
+import "strings"
 
 // SMSArrivals receives a value when any modem announces a new SMS with
 // +CMTI. It is only a wake-up signal: the receiver must list modem storage.
@@ -14,21 +10,17 @@ func (manager *Manager) SMSArrivals() <-chan struct{} {
 	return manager.smsArrivals
 }
 
-// watchSMSURCs signals SMSArrivals for +CMTI from a freshly opened client.
-// The handler runs on the AT session's URC path, so it never blocks.
-func (manager *Manager) watchSMSURCs(client modem.Client) {
-	notifier, ok := client.(modem.URCNotifier)
-	if !ok {
-		return
-	}
-	notifier.SetURCHandler(func(line string) {
+// signalSMSArrival returns an AT session URC handler that signals arrivals
+// for +CMTI. It runs on the session's URC path, so it never blocks.
+func signalSMSArrival(arrivals chan<- struct{}) func(string) {
+	return func(line string) {
 		if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "+CMTI:") {
 			return
 		}
 		select {
-		case manager.smsArrivals <- struct{}{}:
+		case arrivals <- struct{}{}:
 		default:
 			// A wake-up is already pending; its scan will see this message.
 		}
-	})
+	}
 }

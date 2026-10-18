@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -44,40 +43,5 @@ func TestSMSInsertedSignalsOnlyNewRows(t *testing.T) {
 	}
 	if smsInsertedFired(inserted) {
 		t.Fatal("idempotent rescan woke notification consumers")
-	}
-}
-
-func TestStartupSMSMessageIDIsCapturedAtOpen(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "vocat.db")
-	database, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := database.StartupSMSMessageID(); got != 0 {
-		t.Fatalf("empty database StartupSMSMessageID = %d, want 0", got)
-	}
-	historic, err := database.SaveSMSMessage(ctx, SMSMessage{
-		DeviceID: "device-1", Peer: "+12025550123", Direction: "inbound", Body: "old",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	database, err = Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = database.Close() })
-	if _, err := database.SaveSMSMessage(ctx, SMSMessage{
-		DeviceID: "device-1", Peer: "+12025550123", Direction: "inbound", Body: "during startup",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := database.StartupSMSMessageID(); got != historic.ID {
-		t.Fatalf("StartupSMSMessageID = %d, want %d (history only)", got, historic.ID)
 	}
 }

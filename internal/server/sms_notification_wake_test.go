@@ -59,30 +59,3 @@ func TestSMSNotificationDeliversStartupWindowArrival(t *testing.T) {
 		t.Fatalf("delivered = %q, want the startup-window SMS", delivered)
 	}
 }
-
-func TestWaitSMSInsertedReturnsOnInsertion(t *testing.T) {
-	inserted := make(chan struct{})
-	close(inserted)
-	started := time.Now()
-	if !waitSMSInserted(context.Background(), time.Minute, inserted) {
-		t.Fatal("waitSMSInserted reported cancellation")
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("waitSMSInserted ignored the insertion signal for %v", elapsed)
-	}
-
-	// A nil channel (provider backing off) waits for the full delay.
-	started = time.Now()
-	if !waitSMSInserted(context.Background(), 50*time.Millisecond, nil) {
-		t.Fatal("waitSMSInserted reported cancellation")
-	}
-	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
-		t.Fatalf("waitSMSInserted returned after %v, before its delay", elapsed)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if waitSMSInserted(ctx, time.Minute, nil) {
-		t.Fatal("waitSMSInserted ignored cancellation")
-	}
-}

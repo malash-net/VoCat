@@ -24,6 +24,10 @@ type SessionOptions struct {
 	ReadTimeout    time.Duration
 	CommandTimeout time.Duration
 	MaxURCs        int
+	// OnURC, when set, is called for every unsolicited result as soon as it is
+	// parsed, whether it arrived during a command or while the port was idle.
+	// It runs with the session lock held: it must not block or issue commands.
+	OnURC func(string)
 }
 
 func (options SessionOptions) withDefaults() SessionOptions {
@@ -51,7 +55,6 @@ type Session struct {
 	urcs      []string
 	pending   *atTransaction
 	poisoned  atomic.Bool
-	onURC     atomic.Pointer[func(string)]
 
 	recoveryDeadline time.Time
 	ioDeadline       time.Time
@@ -102,18 +105,6 @@ func NewSession(transport Transport, options SessionOptions) (*Session, error) {
 	go session.readLoop()
 	go session.idleLoop()
 	return session, nil
-}
-
-// SetURCHandler registers a callback for every unsolicited result as soon as
-// it is parsed, whether it arrived during a command or while the port was
-// idle. The callback runs with the session lock held: it must not block or
-// issue AT commands. A nil handler removes the callback.
-func (session *Session) SetURCHandler(handler func(string)) {
-	if handler == nil {
-		session.onURC.Store(nil)
-		return
-	}
-	session.onURC.Store(&handler)
 }
 
 // Poisoned reports whether this session must be discarded after a transport
@@ -546,8 +537,8 @@ func (session *Session) WaitURC(ctx context.Context, predicate func(string) bool
 }
 
 func (session *Session) enqueueURCLocked(line string) {
-	if handler := session.onURC.Load(); handler != nil {
-		(*handler)(line)
+	if session.options.OnURC != nil {
+		session.options.OnURC(line)
 	}
 	if len(session.urcs) >= session.options.MaxURCs {
 		copy(session.urcs, session.urcs[1:])

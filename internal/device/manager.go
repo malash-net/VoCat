@@ -146,8 +146,11 @@ func NewManager(options Options) (*Manager, error) {
 	if options.Discoverer == nil {
 		options.Discoverer = modem.NewSystemDiscoverer()
 	}
+	smsArrivals := make(chan struct{}, 1)
 	if options.Opener == nil {
-		options.Opener = modem.SerialOpener{}
+		options.Opener = modem.SerialOpener{
+			SessionOptions: modem.SessionOptions{OnURC: signalSMSArrival(smsArrivals)},
+		}
 	}
 	if options.CommandTimeout <= 0 {
 		options.CommandTimeout = 3 * time.Second
@@ -182,7 +185,7 @@ func NewManager(options Options) (*Manager, error) {
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
-		smsArrivals:                   make(chan struct{}, 1),
+		smsArrivals:                   smsArrivals,
 
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
@@ -560,7 +563,6 @@ func (manager *Manager) clientLocked(
 	if err != nil {
 		return nil, err
 	}
-	manager.watchSMSURCs(client)
 	state.client = client
 	return client, nil
 }

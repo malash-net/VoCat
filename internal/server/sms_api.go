@@ -1114,11 +1114,6 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	}
 }
 
-// smsArrivalSettleDelay gives the modem time to finish writing a message that
-// it announced with +CMTI and lets the remaining segments of a concatenated
-// SMS arrive, so one scan usually stores the complete message.
-const smsArrivalSettleDelay = 500 * time.Millisecond
-
 type cellularSMSArrivalSource interface {
 	SMSArrivals() <-chan struct{}
 }
@@ -1146,15 +1141,9 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
 		case <-arrivals:
-			if !waitTelegram(ctx, smsArrivalSettleDelay) {
-				return
-			}
-			// Fold indications that arrived during the settle delay into this
-			// scan. One arriving during the scan stays buffered for another pass.
-			select {
-			case <-arrivals:
-			default:
-			}
+			// +CMTI follows the write to storage. An indication arriving during
+			// this scan, such as a later multipart segment, stays buffered and
+			// triggers another pass.
 			s.syncModemSMS(ctx, "")
 		}
 	}
