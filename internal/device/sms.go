@@ -184,7 +184,7 @@ func (manager *Manager) ListSMS(
 	logSkipped := func(storage, command string, err error) {
 		if manager.logger != nil {
 			manager.logger.Debug("modem SMS storage skipped while listing",
-				"device_id", id, "storage", storage, "command", command, "error", err)
+				"physical_id", id, "storage", storage, "command", command, "error", err)
 		}
 	}
 	for _, storage := range smsListStorages {

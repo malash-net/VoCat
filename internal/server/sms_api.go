@@ -824,7 +824,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			if saved := saveResult.Message; saveResult.Inserted && saved.Direction == "inbound" &&
 				store.ConcatSMSReadyToNotify(saved.MessageID, saved.Extra) {
 				s.logger.Info("cellular SMS received",
-					"category", "sms", "event", "sms.received",
+					"category", "sms", "event", "sms.received", "sms_id", saved.ID,
 					"device_id", config.ID, "peer", saved.Peer,
 					"transport", "cellular_at", "encoding", message.Encoding,
 					"parts", saved.PartsTotal,
