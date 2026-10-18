@@ -146,16 +146,12 @@ func (state *smsNotificationCursor) logError(server *Server, channel string, err
 type smsNotificationSender func(context.Context, string, map[string]any, smsNotification) error
 
 // runSMSNotificationChannel runs one notification channel until ctx is
-// cancelled. A newly stored SMS wakes it immediately; otherwise it sleeps for
-// the delay returned by each scheduling tick. While a provider is failing only
-// that backoff applies: waking per SMS would exhaust a message's attempts in
-// seconds instead of minutes.
+// cancelled, woken early by a newly stored SMS. While a provider is failing
+// only the backoff delay applies, so new SMS cannot exhaust a message's attempts.
 func (s *Server) runSMSNotificationChannel(ctx context.Context, channel string) {
 	state := &smsNotificationCursor{}
 	for ctx.Err() == nil {
-		// Taken before the tick reads the cursor, so an insertion during the
-		// tick still wakes the next one.
-		inserted := s.store.SMSInserted()
+		inserted := s.store.SMSInserted() // before the tick, so none is missed
 		delay := s.deliverSMSNotificationsOnce(ctx, channel, state, sendSMSNotification)
 		if state.consecutiveFailures > 0 {
 			inserted = nil

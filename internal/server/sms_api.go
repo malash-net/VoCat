@@ -724,8 +724,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
 		// Multipart IDs derive from the first segment's slot in this scan, so
-		// keep every segment in storage until its row is complete, or until
-		// modemSMSIncompleteHoldLimit shows a lost segment will never arrive.
+		// keep segments in storage until complete or modemSMSIncompleteHoldLimit.
 		concatSlots := make(map[string][]modemSMSSlot)
 		concatComplete := make(map[string]bool)
 		concatFirstSeen := make(map[string]time.Time)
@@ -814,8 +813,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				if message.Concat != nil && message.Concat.Total > 1 {
 					concatSlots[messageID] = appendModemSMSSlot(concatSlots[messageID], message)
 					concatComplete[messageID] = store.ConcatSMSReadyToNotify(saveResult.Message.MessageID, saveResult.Message.Extra)
-					// CreatedAt is when VoCat first stored this group, kept across
-					// merges and rescans; unlike SCTS it is never missing or skewed.
+					// Kept across merges and rescans; unlike SCTS never missing or skewed.
 					concatFirstSeen[messageID] = saveResult.Message.CreatedAt
 				} else {
 					clearSlots = appendModemSMSSlot(clearSlots, message)

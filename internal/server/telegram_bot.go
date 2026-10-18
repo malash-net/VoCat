@@ -2292,9 +2292,7 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 	// Reading MAX(id) on the first tick would skip an SMS stored since Open.
 	cursor := bot.server.store.StartupSMSMessageID()
 	for ctx.Err() == nil {
-		// Taken before reading the cursor so an insertion during this pass
-		// still wakes the next one.
-		inserted := bot.server.store.SMSInserted()
+		inserted := bot.server.store.SMSInserted() // before the pass, so none is missed
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
 			bot.warn("load Telegram SMS notification configuration", err)
