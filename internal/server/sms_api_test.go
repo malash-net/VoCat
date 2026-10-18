@@ -805,12 +805,12 @@ func TestHandleSMSSendEnforcesGlobalHourlyLimit(t *testing.T) {
 
 type smsArrivalController struct {
 	fakeDeviceController
-	arrivals *device.SMSEvents
+	arrivals chan struct{}
 	listed   chan string
 }
 
-func (controller smsArrivalController) SubscribeSMSEvents(context.Context) (*device.SMSEvents, error) {
-	return controller.arrivals, nil
+func (controller smsArrivalController) SMSArrivals() <-chan struct{} {
+	return controller.arrivals
 }
 
 func (controller smsArrivalController) ListSMS(_ context.Context, physicalID string) (device.SMSListing, error) {
@@ -836,7 +836,7 @@ func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
 		fakeDeviceController: fakeDeviceController{entry: device.Device{
 			ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{DeviceID: deviceID},
 		}},
-		arrivals: device.NewSMSEvents(),
+		arrivals: make(chan struct{}, 1),
 		listed:   make(chan string, 4),
 	}
 	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
@@ -846,12 +846,7 @@ func TestSMSSyncLoopScansModemOnArrivalEvent(t *testing.T) {
 		server.StartSMSSyncLoop(ctx, time.Hour)
 	}()
 
-	// An arrival on a modem that is not configured must not scan the others,
-	// and a burst from one modem collapses into a single scan.
-	controller.arrivals.Add("other-modem")
-	for range 16 {
-		controller.arrivals.Add(deviceID)
-	}
+	controller.arrivals <- struct{}{}
 	select {
 	case physicalID := <-controller.listed:
 		if physicalID != deviceID {

@@ -692,7 +692,6 @@ func isURC(line string) bool {
 		"+CMTI:",
 		"+CMT:",
 		"+CDS:",
-		"+CDSI:",
 		"+CREG:",
 		"+CGREG:",
 		"+CEREG:",

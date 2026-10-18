@@ -3,10 +3,8 @@ package device
 import (
 	"context"
 	"errors"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"vocat/internal/modem"
@@ -16,115 +14,31 @@ import (
 // stalling its AT port on every storage scan.
 const smsIndicationRetryDelay = 10 * time.Minute
 
-// SMSEvents is one subscription to modem SMS arrival indications. Arrivals
-// are coalesced per physical device: any number of indications from one modem
-// before the next Take collapse into a single pending entry, so a burst on one
-// modem can never crowd out another modem's wake-up.
-type SMSEvents struct {
-	mu      sync.Mutex
-	pending map[string]struct{}
-	wake    chan struct{}
+// SMSArrivals receives a value when any modem announces a new SMS with
+// +CMTI. It is only a wake-up signal: the receiver must list modem storage.
+// The buffer holds one value, so a burst collapses into a single wake-up and
+// an arrival during the receiver's scan wakes it once more afterwards.
+func (manager *Manager) SMSArrivals() <-chan struct{} {
+	return manager.smsArrivals
 }
 
-// NewSMSEvents returns an empty subscription. Manager creates its own through
-// SubscribeSMSEvents; other event sources and tests can feed one with Add.
-func NewSMSEvents() *SMSEvents {
-	return &SMSEvents{pending: make(map[string]struct{}), wake: make(chan struct{}, 1)}
-}
-
-// Wake receives a value whenever at least one device became pending since the
-// last Take. It is closed when the subscription ends.
-func (events *SMSEvents) Wake() <-chan struct{} { return events.wake }
-
-// Take returns and clears the devices with pending arrivals. An arrival that
-// lands after Take is kept for the next Take and re-signals Wake.
-func (events *SMSEvents) Take() []string {
-	events.mu.Lock()
-	defer events.mu.Unlock()
-	devices := make([]string, 0, len(events.pending))
-	for deviceID := range events.pending {
-		devices = append(devices, deviceID)
-	}
-	clear(events.pending)
-	sort.Strings(devices)
-	return devices
-}
-
-// Add marks deviceID as having a pending arrival. It never blocks.
-func (events *SMSEvents) Add(deviceID string) {
-	events.mu.Lock()
-	events.pending[deviceID] = struct{}{}
-	events.mu.Unlock()
-	select {
-	case events.wake <- struct{}{}:
-	default:
-		// A wake-up is already pending; its Take will include this device.
-	}
-}
-
-// SubscribeSMSEvents subscribes to new-message indications (+CMTI, +CDSI and
-// direct +CMT/+CDS) from every modem AT session. Pending entries carry the
-// physical device ID and are only wake-up signals; callers must list modem
-// storage. The subscription ends and Wake closes when ctx is done.
-func (manager *Manager) SubscribeSMSEvents(ctx context.Context) (*SMSEvents, error) {
-	if manager == nil {
-		return nil, ErrNotStarted
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	events := NewSMSEvents()
-	manager.smsEventsMu.Lock()
-	if manager.smsEventSubscribers == nil {
-		manager.smsEventSubscribers = make(map[*SMSEvents]struct{})
-	}
-	manager.smsEventSubscribers[events] = struct{}{}
-	manager.smsEventsMu.Unlock()
-	if done := ctx.Done(); done != nil {
-		go func() {
-			<-done
-			manager.smsEventsMu.Lock()
-			defer manager.smsEventsMu.Unlock()
-			if _, ok := manager.smsEventSubscribers[events]; ok {
-				delete(manager.smsEventSubscribers, events)
-				close(events.wake)
-			}
-		}()
-	}
-	return events, nil
-}
-
-// publishSMSEvent never blocks: it runs on the AT session's URC path.
-func (manager *Manager) publishSMSEvent(deviceID string) {
-	manager.smsEventsMu.Lock()
-	defer manager.smsEventsMu.Unlock()
-	for events := range manager.smsEventSubscribers {
-		events.Add(deviceID)
-	}
-}
-
-// watchSMSURCs routes SMS arrival URCs from a freshly opened client to the
-// SMS event subscribers.
-func (manager *Manager) watchSMSURCs(client modem.Client, deviceID string) {
+// watchSMSURCs signals SMSArrivals for +CMTI from a freshly opened client.
+// The handler runs on the AT session's URC path, so it never blocks.
+func (manager *Manager) watchSMSURCs(client modem.Client) {
 	notifier, ok := client.(modem.URCNotifier)
-	if !ok || strings.TrimSpace(deviceID) == "" {
+	if !ok {
 		return
 	}
 	notifier.SetURCHandler(func(line string) {
-		if isSMSArrivalURC(line) {
-			manager.publishSMSEvent(deviceID)
+		if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "+CMTI:") {
+			return
+		}
+		select {
+		case manager.smsArrivals <- struct{}{}:
+		default:
+			// A wake-up is already pending; its scan will see this message.
 		}
 	})
-}
-
-func isSMSArrivalURC(line string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(line))
-	for _, prefix := range []string{"+CMTI:", "+CMT:", "+CDSI:", "+CDS:"} {
-		if strings.HasPrefix(upper, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // ensureSMSIndications makes the modem store new SMS and announce them with

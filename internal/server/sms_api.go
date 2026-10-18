@@ -639,12 +639,6 @@ func (s *Server) handleSMSMessage(w http.ResponseWriter, r *http.Request, idText
 }
 
 func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
-	s.syncModemSMSFor(ctx, onlyDevice, "")
-}
-
-// syncModemSMSFor scans modem storage for every configured device, or only
-// the device configured as onlyDevice and/or attached as onlyPhysical.
-func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical string) {
 	s.smsSyncMu.Lock()
 	defer s.smsSyncMu.Unlock()
 	if s.devices == nil {
@@ -684,7 +678,7 @@ func (s *Server) syncModemSMSFor(ctx context.Context, onlyDevice, onlyPhysical s
 			}
 		}
 		entry, physicalID, present := s.physicalForConfig(config)
-		if !present || (onlyPhysical != "" && physicalID != onlyPhysical) {
+		if !present {
 			continue
 		}
 		identityBefore := smsIdentityFromSnapshot(entry.Snapshot)
@@ -1118,12 +1112,12 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 // SMS arrive, so one scan usually stores the complete message.
 const smsArrivalSettleDelay = 500 * time.Millisecond
 
-type cellularSMSEventController interface {
-	SubscribeSMSEvents(context.Context) (*device.SMSEvents, error)
+type cellularSMSArrivalSource interface {
+	SMSArrivals() <-chan struct{}
 }
 
 // StartSMSSyncLoop persists inbound cellular SMS even when no client has the
-// SMS page open. A +CMTI indication triggers an immediate scan of that modem;
+// SMS page open. A +CMTI indication from any modem triggers an immediate scan;
 // the periodic tick remains the safety net for modems that do not announce
 // new messages. The first tick is delayed so startup SIM/AKA work gets
 // exclusive use of the modem. Stable VoWiFi sessions still scan SM and ME as a
@@ -1132,15 +1126,9 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
-	var arrivals *device.SMSEvents
-	var wake <-chan struct{}
-	if source, ok := s.devices.(cellularSMSEventController); ok {
-		subscribed, err := source.SubscribeSMSEvents(ctx)
-		if err != nil {
-			s.logger.Warn("could not subscribe to modem SMS arrival events", "error", err)
-		} else {
-			arrivals, wake = subscribed, subscribed.Wake()
-		}
+	var arrivals <-chan struct{}
+	if source, ok := s.devices.(cellularSMSArrivalSource); ok {
+		arrivals = source.SMSArrivals()
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1150,20 +1138,17 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.syncModemSMS(ctx, "")
-		case _, ok := <-wake:
-			if !ok {
-				wake = nil
-				continue
-			}
+		case <-arrivals:
 			if !waitTelegram(ctx, smsArrivalSettleDelay) {
 				return
 			}
-			// Take after the settle delay so every arrival during it, from any
-			// modem, is folded into this pass. Arrivals during the scans below
-			// stay pending and re-signal wake for the next pass.
-			for _, physicalID := range arrivals.Take() {
-				s.syncModemSMSFor(ctx, "", physicalID)
+			// Fold indications that arrived during the settle delay into this
+			// scan. One arriving during the scan stays buffered for another pass.
+			select {
+			case <-arrivals:
+			default:
 			}
+			s.syncModemSMS(ctx, "")
 		}
 	}
 }

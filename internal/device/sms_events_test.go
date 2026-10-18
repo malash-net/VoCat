@@ -44,64 +44,31 @@ func TestManagerPublishesSMSArrivalURCs(t *testing.T) {
 		{command: "AT+CNMI?", response: okResponse("+CNMI: 2,1,0,2,0")},
 	}}}
 	manager, id := newStartedTestManager(t, client)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	events, err := manager.SubscribeSMSEvents(ctx)
-	if err != nil {
-		t.Fatalf("SubscribeSMSEvents: %v", err)
-	}
 	if _, err := manager.ListSMS(context.Background(), id); err != nil {
 		t.Fatalf("ListSMS: %v", err)
 	}
 
-	client.emit("+CEREG: 1")
+	// Only +CMTI announces a stored SMS under the CNMI mode VoCat configures.
+	for _, line := range []string{"+CEREG: 1", `+CMT: "+447700900123",,"26/10/18,10:00:00+00"`, "+CDSI: \"SM\",3"} {
+		client.emit(line)
+	}
 	select {
-	case <-events.Wake():
-		t.Fatalf("non-SMS URC published event for %q", events.Take())
+	case <-manager.SMSArrivals():
+		t.Fatal("non-+CMTI URC signalled an SMS arrival")
 	default:
 	}
 	client.emit(`+CMTI: "SM",5`)
 	client.emit(`+CMTI: "SM",6`)
 	select {
-	case <-events.Wake():
-		if got := events.Take(); len(got) != 1 || got[0] != id {
-			t.Fatalf("pending devices = %q, want [%q]", got, id)
-		}
+	case <-manager.SMSArrivals():
 	case <-time.After(time.Second):
-		t.Fatal("+CMTI did not publish an SMS event")
+		t.Fatal("+CMTI did not signal an SMS arrival")
 	}
-
-	cancel()
-	if _, open := <-events.Wake(); open {
-		t.Fatal("SMS event wake channel stayed open after cancellation")
-	}
-}
-
-func TestSMSEventsCoalescePerDevice(t *testing.T) {
-	events := NewSMSEvents()
-	// The review scenario: a burst on A must not crowd out B's single arrival.
-	for range 16 {
-		events.Add("A")
-	}
-	events.Add("B")
-	<-events.Wake()
-	if got := events.Take(); strings.Join(got, ",") != "A,B" {
-		t.Fatalf("pending devices = %q, want [A B]", got)
-	}
+	// The burst collapses into the single wake-up already consumed.
 	select {
-	case <-events.Wake():
-		t.Fatalf("stale wake-up after Take, pending = %q", events.Take())
+	case <-manager.SMSArrivals():
+		t.Fatal("+CMTI burst produced more than one wake-up")
 	default:
-	}
-	// An arrival while the caller is scanning stays pending for the next pass.
-	events.Add("A")
-	select {
-	case <-events.Wake():
-	default:
-		t.Fatal("arrival after Take did not re-signal wake")
-	}
-	if got := events.Take(); strings.Join(got, ",") != "A" {
-		t.Fatalf("pending devices = %q, want [A]", got)
 	}
 }
 

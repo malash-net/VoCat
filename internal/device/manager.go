@@ -50,8 +50,7 @@ type Manager struct {
 	networkEventSubscribers map[chan string]struct{}
 	deviceEventsMu          sync.Mutex
 	deviceEventSubscribers  map[chan DeviceLifecycleEvent]struct{}
-	smsEventsMu             sync.Mutex
-	smsEventSubscribers     map[*SMSEvents]struct{}
+	smsArrivals             chan struct{}
 
 	qmiRadioOpener                qmiRadioSessionOpener
 	qmiDataOpener                 qmiDataSessionOpener
@@ -186,6 +185,7 @@ func NewManager(options Options) (*Manager, error) {
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
+		smsArrivals:                   make(chan struct{}, 1),
 
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
@@ -563,7 +563,7 @@ func (manager *Manager) clientLocked(
 	if err != nil {
 		return nil, err
 	}
-	manager.watchSMSURCs(client, candidate.ID)
+	manager.watchSMSURCs(client)
 	state.client = client
 	return client, nil
 }
