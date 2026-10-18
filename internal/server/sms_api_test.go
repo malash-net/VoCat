@@ -891,23 +891,30 @@ func TestSyncModemSMSKeepsIncompleteMultipartSegmentsUntilMerged(t *testing.T) {
 			RawPDU: "SM-" + body,
 		}
 	}
+	plain := device.SMSMessage{
+		Index: 2, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: "+447700900999", Text: "plain",
+		Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &receivedAt,
+		RawPDU: "SM-plain",
+	}
 	controller := &smsDeletionController{
 		fakeDeviceController: fakeDeviceController{entry: device.Device{
 			ID: deviceID, Discovered: true,
 			Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
 		}},
-		storedMessages: []device.SMSMessage{segment(3, 1, "part one ")},
+		storedMessages: []device.SMSMessage{plain, segment(3, 1, "part one ")},
 	}
 	server := &Server{store: database, logger: regionTestLogger(), devices: controller}
 
 	// An arrival-triggered scan can run before the second segment is stored.
+	// A complete single-part SMS in the same scan is still cleared.
 	server.syncModemSMS(ctx, deviceID)
 	controller.mu.Lock()
 	deleted := append([]string(nil), controller.deleted...)
 	controller.storedMessages = append(controller.storedMessages, segment(4, 2, "part two"))
 	controller.mu.Unlock()
-	if len(deleted) != 0 {
-		t.Fatalf("incomplete multipart segment was cleared: %v", deleted)
+	if strings.Join(deleted, ",") != "SM:2" {
+		t.Fatalf("first scan deleted %v, want only the single-part SM:2", deleted)
 	}
 
 	server.syncModemSMS(ctx, deviceID)
@@ -916,15 +923,21 @@ func TestSyncModemSMSKeepsIncompleteMultipartSegmentsUntilMerged(t *testing.T) {
 	deleted = append([]string(nil), controller.deleted...)
 	controller.mu.Unlock()
 	sort.Strings(deleted)
-	if remaining != 0 || strings.Join(deleted, ",") != "SM:3,SM:4" {
+	if remaining != 0 || strings.Join(deleted, ",") != "SM:2,SM:3,SM:4" {
 		t.Fatalf("remaining = %d, deleted = %v", remaining, deleted)
 	}
 	stored, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) != 1 || stored[0].Body != "part one part two" ||
-		!store.ConcatSMSReadyToNotify(stored[0].MessageID, stored[0].Extra) {
+	var multipart []store.SMSMessage
+	for _, message := range stored {
+		if message.Peer == "+447700900123" {
+			multipart = append(multipart, message)
+		}
+	}
+	if len(stored) != 2 || len(multipart) != 1 || multipart[0].Body != "part one part two" ||
+		!store.ConcatSMSReadyToNotify(multipart[0].MessageID, multipart[0].Extra) {
 		t.Fatalf("stored messages = %#v", stored)
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -12,11 +13,26 @@ import (
 	"vocat/internal/store"
 )
 
-// An SMS stored after Open but before a dispatcher's first tick (the modem
-// sync loop can run first during startup) must still be notified.
+// After a restart, an SMS stored after Open but before a dispatcher's first
+// tick (the modem sync loop can run first) must still be notified, while
+// history from before the restart must not be replayed.
 func TestSMSNotificationDeliversStartupWindowArrival(t *testing.T) {
 	ctx := context.Background()
-	database, err := store.Open(ctx, ":memory:")
+	path := filepath.Join(t.TempDir(), "vocat.db")
+	database, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.SaveSMSMessage(ctx, store.SMSMessage{
+		DeviceID: "device-1", Peer: "+12025550123", Direction: "inbound",
+		Body: "history before restart", Timestamp: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = store.Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +72,6 @@ func TestSMSNotificationDeliversStartupWindowArrival(t *testing.T) {
 	}
 	server.deliverSMSNotificationsOnce(ctx, "webhook", &smsNotificationCursor{}, sender)
 	if len(delivered) != 1 || delivered[0] != "arrived during startup" {
-		t.Fatalf("delivered = %q, want the startup-window SMS", delivered)
+		t.Fatalf("delivered = %q, want only the startup-window SMS", delivered)
 	}
 }
