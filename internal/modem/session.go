@@ -315,38 +315,15 @@ func (session *Session) idleLoop() {
 }
 
 // consumeIdleLocked parses complete lines while no caller owns the port. A
-// pending transaction seen here was abandoned by a timed-out or cancelled
-// caller (a live caller holds the lock until its final), so its late reply is
-// consumed exactly as readNextLocked does for a departed caller: echo and
-// response lines are discarded, URCs are dispatched, and the final clears it.
-// Prompt handling, an unfinished write, partial lines and read errors are left
-// for the next command, which already knows how to recover them.
+// transaction abandoned by a timed-out or cancelled caller, or its unfinished
+// write, is left to the next command, which already knows how to recover it;
+// until then idle URCs wait for that command as they did before.
 func (session *Session) consumeIdleLocked() {
-	if session.Poisoned() {
+	if session.Poisoned() || session.pending != nil || session.ioDone != nil {
 		return
-	}
-	if session.ioDone != nil {
-		select {
-		case err := <-session.ioDone:
-			session.ioDone = nil
-			if err != nil {
-				return
-			}
-		default:
-			return
-		}
 	}
 	session.receivePendingLocked()
 	for {
-		if session.pending != nil && session.pending.awaitPrompt {
-			return
-		}
-		if session.skipSpace && len(session.readBuf) > 0 {
-			session.skipSpace = false
-			if session.readBuf[0] == ' ' {
-				session.readBuf = session.readBuf[1:]
-			}
-		}
 		line, ok := popLine(&session.readBuf)
 		if !ok {
 			return
@@ -382,12 +359,6 @@ func (session *Session) runIOLocked(ctx context.Context, operation func() error)
 			session.poisoned.Store(true)
 		}
 		done <- err
-		// The idle parser skips input while I/O is unfinished; wake it again so
-		// a reply that arrived meanwhile is not left until the next command.
-		select {
-		case session.readWake <- struct{}{}:
-		default:
-		}
 	}()
 	return session.waitIOLocked(ctx)
 }

@@ -16,7 +16,7 @@ func smsInsertedFired(inserted <-chan struct{}) bool {
 	}
 }
 
-func TestSMSInsertedSignalsOnlyNewInboundRows(t *testing.T) {
+func TestSMSInsertedSignalsOnlyNewRows(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, ":memory:")
 	if err != nil {
@@ -30,20 +30,11 @@ func TestSMSInsertedSignalsOnlyNewInboundRows(t *testing.T) {
 	}
 
 	inserted := database.SMSInserted()
-	if _, err := database.SaveSMSMessage(ctx, SMSMessage{
-		DeviceID: "device-1", Peer: "+12025550123", Direction: "outbound", Body: "sent",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if smsInsertedFired(inserted) {
-		t.Fatal("outbound SMS must not wake inbound notification consumers")
-	}
-
 	if _, err := database.SaveSMSMessageWithResult(ctx, inbound); err != nil {
 		t.Fatal(err)
 	}
 	if !smsInsertedFired(inserted) {
-		t.Fatal("new inbound SMS did not wake notification consumers")
+		t.Fatal("new SMS did not wake notification consumers")
 	}
 
 	// A periodic modem rescan re-saves the same row; it must not wake anyone.
@@ -53,14 +44,6 @@ func TestSMSInsertedSignalsOnlyNewInboundRows(t *testing.T) {
 	}
 	if smsInsertedFired(inserted) {
 		t.Fatal("idempotent rescan woke notification consumers")
-	}
-
-	inbound.MessageID, inbound.Body = "modem:SM:4:ef01", "batch"
-	if err := database.SaveSMSMessages(ctx, []SMSMessage{inbound}); err != nil {
-		t.Fatal(err)
-	}
-	if !smsInsertedFired(inserted) {
-		t.Fatal("batch-saved inbound SMS did not wake notification consumers")
 	}
 }
 

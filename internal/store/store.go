@@ -28,8 +28,8 @@ type Store struct {
 	// startupSMSID is MAX(sms_messages.id) when this process opened the
 	// database, the cursor notification consumers start from.
 	startupSMSID int64
-	// smsInserted is closed and replaced whenever an inbound SMS row receives
-	// a new durable id, waking notification consumers without polling.
+	// smsInserted is closed and replaced whenever an SMS row receives a new
+	// durable id, waking notification consumers without polling.
 	smsInsertedMu sync.Mutex
 	smsInserted   chan struct{}
 }

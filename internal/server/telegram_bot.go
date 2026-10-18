@@ -2293,12 +2293,11 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 	cursor := bot.server.store.StartupSMSMessageID()
 	for ctx.Err() == nil {
 		// Taken before reading the cursor so an insertion during this pass
-		// still wakes the next one. Failures fall back to the fixed period.
+		// still wakes the next one.
 		inserted := bot.server.store.SMSInserted()
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
 			bot.warn("load Telegram SMS notification configuration", err)
-			inserted = nil
 		} else if !enabled {
 			if latest, latestErr := bot.server.store.LatestSMSMessageID(ctx); latestErr == nil {
 				cursor = latest
@@ -2307,7 +2306,6 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 			messages, listErr := bot.server.store.ListInboundSMSAfterID(ctx, cursor, 100)
 			if listErr != nil {
 				bot.warn("list Telegram SMS notifications", listErr)
-				inserted = nil
 			} else {
 				for _, message := range messages {
 					if !smsMessageReadyToNotify(message) {
@@ -2319,7 +2317,6 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 					}
 					if sendErr := bot.sendSMSNotification(ctx, config, message); sendErr != nil {
 						bot.warn("send Telegram SMS notification", sendErr)
-						inserted = nil
 						break
 					}
 					cursor = message.ID
@@ -2629,8 +2626,8 @@ func tailDigits(value string, count int) string {
 	return value[len(value)-count:]
 }
 
-// waitSMSInserted is waitTelegram that also returns early when inserted is
-// closed. A nil inserted channel waits for the full duration.
+// waitSMSInserted waits for duration, returning early when inserted is closed
+// (a nil channel waits the full duration). It reports false if ctx ends first.
 func waitSMSInserted(ctx context.Context, duration time.Duration, inserted <-chan struct{}) bool {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -2645,12 +2642,5 @@ func waitSMSInserted(ctx context.Context, duration time.Duration, inserted <-cha
 }
 
 func waitTelegram(ctx context.Context, duration time.Duration) bool {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
+	return waitSMSInserted(ctx, duration, nil)
 }
