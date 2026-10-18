@@ -674,6 +674,8 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				}
 			}
 			if deferSync {
+				s.logger.Debug("modem SMS synchronization deferred during VoWiFi setup",
+					"category", "sms", "device_id", config.ID, "phase", state.Phase)
 				continue
 			}
 		}
@@ -722,9 +724,11 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		autoClear := developer.AutoClearModemStorage(ctx, s.store)
 		var clearSlots []modemSMSSlot
 		// Multipart IDs derive from the first segment's slot in this scan, so
-		// keep every segment in storage until its row is complete.
+		// keep every segment in storage until its row is complete, or until
+		// modemSMSIncompleteHoldLimit shows a lost segment will never arrive.
 		concatSlots := make(map[string][]modemSMSSlot)
 		concatComplete := make(map[string]bool)
+		concatOldest := make(map[string]time.Time)
 		for _, message := range messages {
 			if message.Direction == device.SMSDirectionStatusReport &&
 				message.MessageReference != nil && message.StatusCode != nil {
@@ -810,6 +814,9 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				if message.Concat != nil && message.Concat.Total > 1 {
 					concatSlots[messageID] = appendModemSMSSlot(concatSlots[messageID], message)
 					concatComplete[messageID] = store.ConcatSMSReadyToNotify(saveResult.Message.MessageID, saveResult.Message.Extra)
+					if oldest, seen := concatOldest[messageID]; !seen || timestamp.Before(oldest) {
+						concatOldest[messageID] = timestamp
+					}
 				} else {
 					clearSlots = appendModemSMSSlot(clearSlots, message)
 				}
@@ -827,6 +834,11 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 		if autoClear {
 			for messageID, slots := range concatSlots {
 				if concatComplete[messageID] {
+					clearSlots = append(clearSlots, slots...)
+				} else if time.Since(concatOldest[messageID]) > modemSMSIncompleteHoldLimit {
+					s.logger.Info("clearing incomplete multipart SMS from modem storage",
+						"category", "sms", "device_id", config.ID, "segments", len(slots),
+						"oldest", concatOldest[messageID])
 					clearSlots = append(clearSlots, slots...)
 				}
 			}
@@ -1110,6 +1122,11 @@ func shouldDeferModemSMSSync(state vowifi.State, stateErr error) bool {
 	}
 }
 
+// modemSMSIncompleteHoldLimit bounds how long segments of an incomplete
+// multipart SMS occupy modem storage, so a segment the carrier lost cannot
+// fill the limited slots forever.
+const modemSMSIncompleteHoldLimit = 24 * time.Hour
+
 type cellularSMSArrivalSource interface {
 	SMSArrivals() <-chan struct{}
 }
@@ -1127,6 +1144,12 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 	if source, ok := s.devices.(cellularSMSArrivalSource); ok {
 		arrivals = source.SMSArrivals()
 	}
+	scan := func(trigger string) {
+		started := time.Now()
+		s.syncModemSMS(ctx, "")
+		s.logger.Debug("modem SMS scan finished",
+			"category", "sms", "trigger", trigger, "duration", time.Since(started))
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1134,10 +1157,10 @@ func (s *Server) StartSMSSyncLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.syncModemSMS(ctx, "")
+			scan("tick")
 		case <-arrivals:
 			// One arriving during the scan stays buffered for another pass.
-			s.syncModemSMS(ctx, "")
+			scan("cmti")
 		}
 	}
 }
