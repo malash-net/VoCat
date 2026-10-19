@@ -382,6 +382,36 @@ func (s *Store) LatestSMSMessageID(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
+// smsNotificationCursorKey prefixes the per-channel notification cursor.
+const smsNotificationCursorKey = "sms.notification_cursor:"
+
+// SMSNotificationCursor returns the last message a channel notified, or the
+// startup history boundary when it never notified. A restart resumes past what
+// was already sent but still delivers what was stored and not yet notified.
+func (s *Store) SMSNotificationCursor(ctx context.Context, channel string) (int64, error) {
+	setting, err := s.AppSetting(ctx, smsNotificationCursorKey+channel)
+	if errors.Is(err, ErrNotFound) {
+		return s.startupSMSID, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var id int64
+	if err := json.Unmarshal(setting.Value, &id); err != nil {
+		return s.startupSMSID, nil
+	}
+	return id, nil
+}
+
+// SetSMSNotificationCursor records how far a channel has notified.
+func (s *Store) SetSMSNotificationCursor(ctx context.Context, channel string, id int64) error {
+	payload, err := json.Marshal(id)
+	if err != nil {
+		return err
+	}
+	return s.UpsertAppSetting(ctx, AppSetting{Key: smsNotificationCursorKey + channel, Value: payload})
+}
+
 // ListInboundSMSAfterID returns newly inserted inbound messages in durable ID
 // order. Telegram advances this cursor only after considering each item, so
 // timestamp corrections and duplicate modem synchronisations cannot reorder or

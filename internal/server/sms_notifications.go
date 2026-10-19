@@ -131,6 +131,15 @@ type smsNotificationCursor struct {
 	failedAttempts      int
 }
 
+// advance moves the cursor and persists it, so a restart resumes here instead
+// of losing the message or notifying it twice.
+func (state *smsNotificationCursor) advance(ctx context.Context, server *Server, channel string, id int64) {
+	state.id = id
+	if err := server.store.SetSMSNotificationCursor(ctx, channel, id); err != nil {
+		state.logError(server, channel, err)
+	}
+}
+
 // logError reports a channel dispatch error through the server logger. Repeats
 // of the same error within a minute are suppressed so a provider that is down
 // cannot flood the log at the polling cadence.
@@ -171,16 +180,22 @@ func (s *Server) deliverSMSNotificationsOnce(
 	send smsNotificationSender,
 ) time.Duration {
 	if !state.initialized {
-		// Reading MAX(id) here would skip an SMS stored between Open and this
-		// first tick.
-		state.id, state.initialized = s.store.StartupSMSMessageID(), true
+		stored, err := s.store.SMSNotificationCursor(ctx, channel)
+		if err != nil {
+			state.logError(s, channel, err)
+			return smsNotificationPollInterval
+		}
+		state.id, state.initialized = stored, true
+		state.lastError = ""
 	}
 	config, enabled, configErr := s.smsNotificationConfig(ctx, channel)
 	if configErr != nil {
 		state.logError(s, channel, configErr)
 	} else if !enabled {
+		// A disabled channel skips the backlog and records that, so enabling it
+		// later does not replay history.
 		if newest, latestErr := s.store.LatestSMSMessageID(ctx); latestErr == nil {
-			state.id = newest
+			state.advance(ctx, s, channel, newest)
 		}
 		state.lastError = ""
 	} else {
@@ -209,7 +224,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 							"dropping inbound SMS notification %d after %d attempts: %w",
 							message.ID, state.failedAttempts, sendErr,
 						))
-						state.id = message.ID
+						state.advance(ctx, s, channel, message.ID)
 						state.failedMessageID, state.failedAttempts = 0, 0
 						state.consecutiveFailures = 0
 						continue
@@ -218,7 +233,7 @@ func (s *Server) deliverSMSNotificationsOnce(
 				}
 				s.logger.Debug("SMS notification sent",
 					"category", "sms", "channel", channel, "sms_id", message.ID)
-				state.id = message.ID
+				state.advance(ctx, s, channel, message.ID)
 				state.lastError = ""
 				state.consecutiveFailures = 0
 				state.failedMessageID, state.failedAttempts = 0, 0

@@ -2287,17 +2287,34 @@ func (bot *telegramBot) sendSMSNotification(ctx context.Context, config telegram
 	return bot.sendText(ctx, config, 0, text, nil)
 }
 
+// persistSMSCursor records how far Telegram has notified, so a restart resumes
+// here rather than losing or repeating the message.
+func (bot *telegramBot) persistSMSCursor(ctx context.Context, id int64) {
+	if err := bot.server.store.SetSMSNotificationCursor(ctx, "telegram", id); err != nil {
+		bot.warn("persist Telegram SMS cursor", err)
+	}
+}
+
 func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
-	// Reading MAX(id) on the first tick would skip an SMS stored since Open.
-	cursor := bot.server.store.StartupSMSMessageID()
+	// Reading MAX(id) on the first tick would skip an SMS stored since Open;
+	// the persisted cursor also covers one stored but not yet notified before
+	// the previous process stopped.
+	cursor, err := bot.server.store.SMSNotificationCursor(ctx, "telegram")
+	if err != nil {
+		bot.warn("initialize Telegram SMS cursor", err)
+		cursor = bot.server.store.StartupSMSMessageID()
+	}
 	for ctx.Err() == nil {
 		inserted := bot.server.store.SMSInserted() // before the pass, so none is missed
 		config, enabled, err := bot.loadConfig(ctx)
 		if err != nil {
 			bot.warn("load Telegram SMS notification configuration", err)
 		} else if !enabled {
+			// A disabled channel skips the backlog and records that, so enabling
+			// it later does not replay history.
 			if latest, latestErr := bot.server.store.LatestSMSMessageID(ctx); latestErr == nil {
 				cursor = latest
+				bot.persistSMSCursor(ctx, latest)
 			}
 		} else {
 			messages, listErr := bot.server.store.ListInboundSMSAfterID(ctx, cursor, 100)
@@ -2321,6 +2338,7 @@ func (bot *telegramBot) notifyInboundSMS(ctx context.Context) {
 							"category", "sms", "channel", "telegram", "sms_id", message.ID)
 					}
 					cursor = message.ID
+					bot.persistSMSCursor(ctx, message.ID)
 				}
 			}
 		}
